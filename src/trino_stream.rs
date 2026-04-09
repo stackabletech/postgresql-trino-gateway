@@ -131,14 +131,9 @@ pub async fn execute_trino_query(
         }
     }
 
-    if trino_columns.is_empty() {
-        let info = crate::error_mapping::trino_error_to_pg(
-            "Trino query completed without returning column metadata",
-        );
-        return Err(PgWireError::UserError(Box::new(info)));
-    }
-
-    // 4. Build PG schema
+    // 4. Build PG schema (or empty for DDL/DML)
+    // When schema is empty, the caller should return Response::Execution instead
+    // of Response::Query.
     let schema = build_pg_schema(&trino_columns);
 
     // 6. Create streaming bridge

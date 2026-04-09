@@ -6,7 +6,7 @@ use futures::Sink;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::ExtendedQueryHandler;
 use pgwire::api::results::{
-    DescribePortalResponse, DescribeStatementResponse, QueryResponse, Response,
+    DescribePortalResponse, DescribeStatementResponse, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
@@ -79,7 +79,11 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
 
         let (schema, row_stream) = execute_trino_query(&trino_client, rewritten).await?;
 
-        Ok(Response::Query(QueryResponse::new(schema, row_stream)))
+        if schema.is_empty() {
+            Ok(Response::Execution(Tag::new("OK")))
+        } else {
+            Ok(Response::Query(QueryResponse::new(schema, row_stream)))
+        }
     }
 
     async fn do_describe_statement<C>(

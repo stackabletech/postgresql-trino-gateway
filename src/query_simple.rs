@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Sink;
-use pgwire::api::results::{QueryResponse, Response};
+use pgwire::api::results::{QueryResponse, Response, Tag};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore};
 use pgwire::error::{PgWireError, PgWireResult};
@@ -52,6 +52,11 @@ impl SimpleQueryHandler for GatewayQueryHandler {
         let (schema, row_stream) =
             execute_trino_query(&trino_client, rewritten).await?;
 
-        Ok(vec![Response::Query(QueryResponse::new(schema, row_stream))])
+        if schema.is_empty() {
+            // DDL/DML — no result set
+            Ok(vec![Response::Execution(Tag::new("OK"))])
+        } else {
+            Ok(vec![Response::Query(QueryResponse::new(schema, row_stream))])
+        }
     }
 }
