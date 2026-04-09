@@ -12,10 +12,12 @@ use postgresql_trino_gateway::startup::GatewayStartupHandler;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
 
-    let config = Config::parse();
+    let config = Arc::new(Config::parse());
 
     let factory = Arc::new(GatewayHandlerFactory {
-        startup: Arc::new(GatewayStartupHandler),
+        startup: Arc::new(GatewayStartupHandler {
+            config: config.clone(),
+        }),
         query: Arc::new(GatewayQueryHandler),
     });
 

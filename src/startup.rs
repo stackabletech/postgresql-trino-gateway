@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Sink;
@@ -10,6 +11,8 @@ use pgwire::api::auth::{
 };
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+
+use crate::config::Config;
 
 /// Server parameter provider that returns PostgreSQL-compatible parameters.
 #[derive(Debug)]
@@ -37,7 +40,9 @@ impl ServerParameterProvider for GatewayParameterProvider {
 
 /// Handles the startup/authentication phase of a PostgreSQL connection.
 #[derive(Debug)]
-pub struct GatewayStartupHandler;
+pub struct GatewayStartupHandler {
+    pub config: Arc<Config>,
+}
 
 #[async_trait]
 impl StartupHandler for GatewayStartupHandler {
@@ -55,6 +60,18 @@ impl StartupHandler for GatewayStartupHandler {
             protocol_negotiation(client, startup).await?;
             save_startup_parameters_to_metadata(client, startup);
             finish_authentication(client, &GatewayParameterProvider).await?;
+
+            let trino_client = trino_rust_client::ClientBuilder::new(
+                &self.config.trino_user,
+                &self.config.trino_host,
+            )
+            .port(self.config.trino_port)
+            .catalog(&self.config.trino_catalog)
+            .schema(&self.config.trino_schema)
+            .build()
+            .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+
+            client.session_extensions().insert(trino_client);
 
             tracing::info!(
                 addr = %client.socket_addr(),

@@ -75,7 +75,7 @@ fn extract_direct_rows(data: Option<QueryResultData<Row>>) -> Vec<Vec<Value>> {
 pub async fn execute_trino_query(
     client: &Arc<Client>,
     sql: String,
-) -> Result<(Arc<Vec<FieldInfo>>, impl Stream<Item = PgWireResult<DataRow>>), PgWireError> {
+) -> Result<(Arc<Vec<FieldInfo>>, impl Stream<Item = PgWireResult<DataRow>> + use<>), PgWireError> {
     // 1. Submit query
     let result = client
         .get::<Row>(sql)
