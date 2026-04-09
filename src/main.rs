@@ -5,6 +5,7 @@ use tokio::net::TcpListener;
 
 use postgresql_trino_gateway::config::Config;
 use postgresql_trino_gateway::handler::GatewayHandlerFactory;
+use postgresql_trino_gateway::query_extended::GatewayExtendedQueryHandler;
 use postgresql_trino_gateway::query_simple::GatewayQueryHandler;
 use postgresql_trino_gateway::startup::GatewayStartupHandler;
 
@@ -19,6 +20,7 @@ async fn main() -> anyhow::Result<()> {
             config: config.clone(),
         }),
         query: Arc::new(GatewayQueryHandler),
+        extended_query: Arc::new(GatewayExtendedQueryHandler),
     });
 
     let listener = TcpListener::bind(&config.listen_addr).await?;

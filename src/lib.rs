@@ -2,6 +2,7 @@ pub mod catalog;
 pub mod config;
 pub mod handler;
 pub mod intercept;
+pub mod query_extended;
 pub mod query_simple;
 pub mod rewrite;
 pub mod startup;
