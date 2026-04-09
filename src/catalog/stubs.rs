@@ -53,8 +53,9 @@ pub fn respond_pg_namespace() -> PgWireResult<Vec<Response>> {
     build_response(schema, rows)
 }
 
-/// Empty pg_class response. Refined in Task 7.
+/// Empty pg_class response (test-only; production uses pg_class::respond_pg_class).
 /// Columns: oid (INT4), relname (VARCHAR), relnamespace (INT4), relkind (VARCHAR). Zero rows.
+#[cfg(test)]
 pub fn empty_pg_class() -> PgWireResult<Vec<Response>> {
     let schema = Arc::new(vec![
         FieldInfo::new("oid".to_owned(), None, None, Type::INT4, FieldFormat::Text),
@@ -65,9 +66,10 @@ pub fn empty_pg_class() -> PgWireResult<Vec<Response>> {
     build_response(schema, vec![])
 }
 
-/// Empty pg_attribute response. Refined in Task 7.
+/// Empty pg_attribute response (test-only; production uses pg_attribute::respond_pg_attribute).
 /// Columns: attrelid (INT4), attname (VARCHAR), atttypid (INT4), attnum (INT2),
 ///          attnotnull (BOOL), attisdropped (BOOL). Zero rows.
+#[cfg(test)]
 pub fn empty_pg_attribute() -> PgWireResult<Vec<Response>> {
     let schema = Arc::new(vec![
         FieldInfo::new("attrelid".to_owned(), None, None, Type::INT4, FieldFormat::Text),

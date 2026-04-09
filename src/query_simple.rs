@@ -29,6 +29,7 @@ impl SimpleQueryHandler for GatewayQueryHandler {
     {
         tracing::debug!(query, "Received query");
 
+        // Static catalog interception (pg_type, pg_enum, pg_range, pg_namespace, etc.)
         if let Some(result) = crate::intercept::intercept_query(query) {
             return result;
         }
@@ -37,6 +38,13 @@ impl SimpleQueryHandler for GatewayQueryHandler {
             .session_extensions()
             .get::<TrinoClient>()
             .ok_or_else(|| PgWireError::ApiError("No Trino client in session".into()))?;
+
+        // Dynamic catalog interception (pg_class, pg_attribute — needs Trino client)
+        if let Some(result) =
+            crate::catalog::handle_dynamic_catalog_query(query, &trino_client).await
+        {
+            return result;
+        }
 
         let rewritten = crate::rewrite::rewrite_sql(query);
         tracing::debug!(original = query, rewritten = %rewritten, "Rewritten query");

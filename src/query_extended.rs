@@ -48,7 +48,7 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         let query = &portal.statement.statement;
         tracing::debug!(query, "Extended query execute");
 
-        // Check intercept layer first.
+        // Static catalog interception (pg_type, pg_enum, pg_range, pg_namespace, etc.)
         if let Some(result) = crate::intercept::intercept_query(query) {
             // intercept_query returns PgWireResult<Vec<Response>>; take the first.
             let responses = result?;
@@ -58,13 +58,24 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
                 .ok_or_else(|| PgWireError::ApiError("Empty intercept response".into()));
         }
 
-        let rewritten = crate::rewrite::rewrite_sql(query);
-        tracing::debug!(original = query, rewritten = %rewritten, "Rewritten extended query");
-
         let trino_client: Arc<TrinoClient> = client
             .session_extensions()
             .get::<TrinoClient>()
             .ok_or_else(|| PgWireError::ApiError("No Trino client in session".into()))?;
+
+        // Dynamic catalog interception (pg_class, pg_attribute — needs Trino client)
+        if let Some(result) =
+            crate::catalog::handle_dynamic_catalog_query(query, &trino_client).await
+        {
+            let responses = result?;
+            return responses
+                .into_iter()
+                .next()
+                .ok_or_else(|| PgWireError::ApiError("Empty dynamic catalog response".into()));
+        }
+
+        let rewritten = crate::rewrite::rewrite_sql(query);
+        tracing::debug!(original = query, rewritten = %rewritten, "Rewritten extended query");
 
         let (schema, row_stream) = execute_trino_query(&trino_client, rewritten).await?;
 

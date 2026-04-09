@@ -1,3 +1,5 @@
+mod pg_attribute;
+pub(crate) mod pg_class;
 mod pg_type;
 mod stubs;
 
@@ -6,6 +8,7 @@ use std::sync::Arc;
 use futures::stream;
 use pgwire::api::results::{DataRowEncoder, FieldInfo, QueryResponse, Response};
 use pgwire::error::PgWireResult;
+use trino_rust_client::Client;
 
 /// Build a QueryResponse from a schema and rows of string values.
 ///
@@ -70,14 +73,37 @@ pub fn handle_catalog_query(query: &str) -> Option<PgWireResult<Vec<Response>>> 
         return Some(stubs::respond_pg_namespace());
     }
 
-    // pg_class (refined in Task 7)
-    if upper.contains("FROM PG_CLASS") {
-        return Some(stubs::empty_pg_class());
+    // pg_class and pg_attribute are handled dynamically (need Trino client).
+    // See `handle_dynamic_catalog_query`.
+
+    None
+}
+
+/// Check whether a query targets pg_class or pg_attribute and, if so, query
+/// Trino's information_schema to build a real response.
+///
+/// Returns `Some(result)` for dynamic catalog queries, `None` otherwise.
+pub async fn handle_dynamic_catalog_query(
+    query: &str,
+    client: &Arc<Client>,
+) -> Option<PgWireResult<Vec<Response>>> {
+    let upper = query.to_uppercase();
+
+    // pg_attribute + pg_type join = composite field lookup (stay static)
+    if upper.contains("PG_ATTRIBUTE") && upper.contains("PG_TYPE") {
+        return None; // handled by static intercept
     }
 
-    // pg_attribute alone (refined in Task 7)
-    if upper.contains("FROM PG_ATTRIBUTE") {
-        return Some(stubs::empty_pg_attribute());
+    // pg_class
+    if upper.contains("FROM PG_CLASS") || upper.contains("JOIN PG_CLASS") {
+        tracing::debug!("Dynamic catalog: pg_class");
+        return Some(pg_class::respond_pg_class(client).await);
+    }
+
+    // pg_attribute (standalone, not the pg_attribute+pg_type join)
+    if upper.contains("FROM PG_ATTRIBUTE") || upper.contains("JOIN PG_ATTRIBUTE") {
+        tracing::debug!("Dynamic catalog: pg_attribute");
+        return Some(pg_attribute::respond_pg_attribute(client).await);
     }
 
     None
@@ -130,15 +156,17 @@ mod tests {
     }
 
     #[test]
-    fn pg_class_detected() {
+    fn pg_class_not_static() {
+        // pg_class is now handled dynamically, not by the static handler.
         let query = "SELECT * FROM pg_class WHERE relkind = 'r'";
-        assert!(handle_catalog_query(query).is_some());
+        assert!(handle_catalog_query(query).is_none());
     }
 
     #[test]
-    fn pg_attribute_detected() {
+    fn pg_attribute_not_static() {
+        // pg_attribute (standalone) is now handled dynamically.
         let query = "SELECT * FROM pg_attribute WHERE attrelid = 1234";
-        assert!(handle_catalog_query(query).is_some());
+        assert!(handle_catalog_query(query).is_none());
     }
 
     #[test]
