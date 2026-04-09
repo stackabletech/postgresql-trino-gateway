@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
 use futures::stream;
-use pgwire::api::results::{
-    DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag,
-};
 use pgwire::api::Type;
+use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo, QueryResponse, Response, Tag};
 use pgwire::error::PgWireResult;
 
 /// Build a single-column, single-row VARCHAR text response.
@@ -29,7 +27,11 @@ fn single_text_response(column_name: &str, value: &str) -> PgWireResult<Vec<Resp
 
 /// Check whether a query should be intercepted locally instead of forwarded to
 /// Trino. Returns `Some(response)` for intercepted queries, `None` otherwise.
-pub fn intercept_query(query: &str) -> Option<PgWireResult<Vec<Response>>> {
+pub fn intercept_query(
+    query: &str,
+    catalog: &str,
+    schema: &str,
+) -> Option<PgWireResult<Vec<Response>>> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return None;
@@ -60,7 +62,7 @@ pub fn intercept_query(query: &str) -> Option<PgWireResult<Vec<Response>>> {
     }
 
     // Server info functions
-    if let Some(resp) = intercept_server_functions(&upper) {
+    if let Some(resp) = intercept_server_functions(&upper, catalog, schema) {
         return Some(resp);
     }
 
@@ -73,10 +75,7 @@ pub fn intercept_query(query: &str) -> Option<PgWireResult<Vec<Response>>> {
 }
 
 fn intercept_transaction(upper: &str) -> Option<PgWireResult<Vec<Response>>> {
-    if upper == "BEGIN"
-        || upper.starts_with("BEGIN ")
-        || upper.starts_with("START TRANSACTION")
-    {
+    if upper == "BEGIN" || upper.starts_with("BEGIN ") || upper.starts_with("START TRANSACTION") {
         return Some(Ok(vec![Response::Execution(Tag::new("BEGIN"))]));
     }
     if upper == "COMMIT" || upper == "END" {
@@ -118,7 +117,11 @@ fn intercept_show(trimmed: &str) -> PgWireResult<Vec<Response>> {
     single_text_response(&param, value)
 }
 
-fn intercept_server_functions(upper: &str) -> Option<PgWireResult<Vec<Response>>> {
+fn intercept_server_functions(
+    upper: &str,
+    catalog: &str,
+    schema: &str,
+) -> Option<PgWireResult<Vec<Response>>> {
     if upper.contains("VERSION()") {
         return Some(single_text_response(
             "version",
@@ -127,12 +130,11 @@ fn intercept_server_functions(upper: &str) -> Option<PgWireResult<Vec<Response>>
     }
 
     if upper.contains("CURRENT_DATABASE()") {
-        // TODO: should come from config
-        return Some(single_text_response("current_database", "memory"));
+        return Some(single_text_response("current_database", catalog));
     }
 
     if upper.contains("CURRENT_SCHEMA") {
-        return Some(single_text_response("current_schema", "public"));
+        return Some(single_text_response("current_schema", schema));
     }
 
     if upper.contains("PG_IS_IN_RECOVERY()") {
@@ -157,7 +159,7 @@ mod tests {
     /// Helper: assert that a query is intercepted (returns Some).
     fn assert_intercepted(query: &str) {
         assert!(
-            intercept_query(query).is_some(),
+            intercept_query(query, "test_catalog", "test_schema").is_some(),
             "expected query to be intercepted: {query}"
         );
     }
@@ -165,7 +167,7 @@ mod tests {
     /// Helper: assert that a query is NOT intercepted (returns None).
     fn assert_not_intercepted(query: &str) {
         assert!(
-            intercept_query(query).is_none(),
+            intercept_query(query, "test_catalog", "test_schema").is_none(),
             "expected query to NOT be intercepted: {query}"
         );
     }
@@ -214,7 +216,7 @@ mod tests {
         ];
 
         for &(query, expected) in cases {
-            let result = intercept_query(query)
+            let result = intercept_query(query, "test_catalog", "test_schema")
                 .unwrap_or_else(|| panic!("SHOW not intercepted: {query}"));
             // We just verify it returns Ok; the value is embedded inside the
             // encoded DataRow which is opaque here, but at least we confirm

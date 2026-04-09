@@ -10,9 +10,23 @@ use crate::startup::GatewayStartupHandler;
 
 /// Factory that provides handler implementations to pgwire.
 pub struct GatewayHandlerFactory {
-    pub startup: Arc<GatewayStartupHandler>,
-    pub query: Arc<GatewayQueryHandler>,
-    pub extended_query: Arc<GatewayExtendedQueryHandler>,
+    pub(crate) startup: Arc<GatewayStartupHandler>,
+    pub(crate) query: Arc<GatewayQueryHandler>,
+    pub(crate) extended_query: Arc<GatewayExtendedQueryHandler>,
+}
+
+impl GatewayHandlerFactory {
+    pub fn new(
+        startup: Arc<GatewayStartupHandler>,
+        query: Arc<GatewayQueryHandler>,
+        extended_query: Arc<GatewayExtendedQueryHandler>,
+    ) -> Self {
+        Self {
+            startup,
+            query,
+            extended_query,
+        }
+    }
 }
 
 impl PgWireServerHandlers for GatewayHandlerFactory {

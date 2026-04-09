@@ -1,8 +1,7 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
-use pgwire::api::results::{FieldFormat, FieldInfo, Response};
 use pgwire::api::Type;
+use pgwire::api::results::{FieldFormat, FieldInfo, Response};
 use pgwire::error::{PgWireError, PgWireResult};
 use trino_rust_client::{Client, Row};
 
@@ -47,7 +46,7 @@ pub fn namespace_oid(schema_name: &str) -> u32 {
     for b in schema_name.bytes() {
         h = h.wrapping_mul(33).wrapping_add(u32::from(b));
     }
-    BASE_NAMESPACE_OID + (h % 10000)
+    BASE_NAMESPACE_OID + (h % (i32::MAX as u32 - BASE_NAMESPACE_OID))
 }
 
 /// Map Trino's table_type string to PostgreSQL's relkind char.
@@ -97,30 +96,20 @@ pub async fn respond_pg_class(client: &Arc<Client>) -> PgWireResult<Vec<Response
     ]);
 
     let mut rows = Vec::new();
-    // Track OIDs we've already used to avoid duplicates in the unlikely case
-    // of hash collision.
-    let mut seen_oids = HashMap::new();
 
     for trino_row in dataset.into_vec() {
         let values = trino_row.into_json();
         // columns: table_schema (0), table_name (1), table_type (2)
-        let schema_name = values
-            .first()
-            .and_then(|v| v.as_str())
-            .unwrap_or("public");
+        let schema_name = values.first().and_then(|v| v.as_str()).unwrap_or("public");
         let tbl_name = values.get(1).and_then(|v| v.as_str()).unwrap_or("");
-        let tbl_type = values.get(2).and_then(|v| v.as_str()).unwrap_or("BASE TABLE");
+        let tbl_type = values
+            .get(2)
+            .and_then(|v| v.as_str())
+            .unwrap_or("BASE TABLE");
 
         let oid = table_oid(schema_name, tbl_name);
         let ns_oid = namespace_oid(schema_name);
         let kind = relkind(tbl_type);
-
-        // Skip duplicates from hash collision
-        let key = (schema_name.to_owned(), tbl_name.to_owned());
-        if seen_oids.contains_key(&key) {
-            continue;
-        }
-        seen_oids.insert(key, oid);
 
         rows.push(vec![
             Some(oid.to_string()),

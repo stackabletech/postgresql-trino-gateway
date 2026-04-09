@@ -29,10 +29,7 @@ impl ServerParameterProvider for GatewayParameterProvider {
         params.insert("client_encoding".to_owned(), "UTF8".to_owned());
         params.insert("DateStyle".to_owned(), "ISO, MDY".to_owned());
         params.insert("integer_datetimes".to_owned(), "on".to_owned());
-        params.insert(
-            "standard_conforming_strings".to_owned(),
-            "on".to_owned(),
-        );
+        params.insert("standard_conforming_strings".to_owned(), "on".to_owned());
         params.insert("TimeZone".to_owned(), "UTC".to_owned());
         Some(params)
     }
@@ -81,11 +78,16 @@ impl StartupHandler for GatewayStartupHandler {
                 .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
 
             client.session_extensions().insert(trino_client);
+            client.session_extensions().insert((*self.config).clone());
 
             tracing::info!(
                 addr = %client.socket_addr(),
                 "client connected",
             );
+        } else {
+            return Err(PgWireError::ApiError(
+                "Expected Startup message during connection setup".into(),
+            ));
         }
 
         Ok(())

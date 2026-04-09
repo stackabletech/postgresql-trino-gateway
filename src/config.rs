@@ -1,7 +1,9 @@
 use clap::Parser;
 
 /// PostgreSQL-to-Trino gateway configuration.
-#[derive(Debug, Parser)]
+// WARNING: Debug is derived for clap compatibility. If credential fields
+// (password, token) are ever added, implement Debug manually to redact them.
+#[derive(Clone, Debug, Parser)]
 #[command(name = "postgresql-trino-gateway")]
 pub struct Config {
     /// Address to listen on for PostgreSQL connections.

@@ -8,6 +8,13 @@ use sqlparser::parser::Parser;
 
 /// Rewrites PostgreSQL-dialect SQL into Trino-compatible SQL.
 ///
+/// # Security
+///
+/// This function relies on sqlparser's round-trip (parse -> transform -> to_string)
+/// being semantics-preserving. On parse failure, the original SQL is returned
+/// unchanged -- no partial rewrites. The rewriter only transforms AST nodes,
+/// never raw strings, which prevents rewriting-induced SQL injection.
+///
 /// Applies the following transformations:
 /// - `::` cast syntax becomes `CAST(... AS ...)`
 /// - PostgreSQL type names are normalized to Trino equivalents
@@ -93,10 +100,7 @@ mod tests {
     #[test]
     fn test_function_rename_string_agg() {
         let result = rewrite_sql("SELECT string_agg(name, ',') FROM t");
-        assert!(
-            result.contains("listagg"),
-            "expected listagg in: {result}"
-        );
+        assert!(result.contains("listagg"), "expected listagg in: {result}");
     }
 
     #[test]

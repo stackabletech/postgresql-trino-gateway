@@ -6,16 +6,16 @@ use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
 use serde_json::Value;
-use trino_rust_client::models::{QueryResultData, Column};
+use trino_rust_client::models::{Column, QueryResultData};
 use trino_rust_client::{Client, Row};
 
 use crate::types::{encode_value, trino_type_to_pg};
 
 /// Column metadata from Trino, used for encoding.
 #[derive(Clone)]
-pub struct TrinoColumn {
-    pub name: String,
-    pub trino_type: String,
+pub(crate) struct TrinoColumn {
+    pub(crate) name: String,
+    pub(crate) trino_type: String,
 }
 
 impl From<&Column> for TrinoColumn {
@@ -28,7 +28,7 @@ impl From<&Column> for TrinoColumn {
 }
 
 /// Build pgwire FieldInfo schema from Trino columns.
-pub fn build_pg_schema(columns: &[TrinoColumn]) -> Arc<Vec<FieldInfo>> {
+pub(crate) fn build_pg_schema(columns: &[TrinoColumn]) -> Arc<Vec<FieldInfo>> {
     Arc::new(
         columns
             .iter()
@@ -46,7 +46,7 @@ pub fn build_pg_schema(columns: &[TrinoColumn]) -> Arc<Vec<FieldInfo>> {
 }
 
 /// Encode one Trino row (slice of serde_json::Value) into a PG DataRow.
-pub fn encode_row(
+pub(crate) fn encode_row(
     values: &[Value],
     columns: &[TrinoColumn],
     schema: &Arc<Vec<FieldInfo>>,
@@ -75,15 +75,18 @@ fn extract_direct_rows(data: Option<QueryResultData<Row>>) -> Vec<Vec<Value>> {
 pub async fn execute_trino_query(
     client: &Arc<Client>,
     sql: String,
-) -> Result<(Arc<Vec<FieldInfo>>, impl Stream<Item = PgWireResult<DataRow>> + use<>), PgWireError> {
+) -> Result<
+    (
+        Arc<Vec<FieldInfo>>,
+        impl Stream<Item = PgWireResult<DataRow>> + use<>,
+    ),
+    PgWireError,
+> {
     // 1. Submit query
-    let result = client
-        .get::<Row>(sql)
-        .await
-        .map_err(|e| {
-            let info = crate::error_mapping::trino_error_to_pg(&e.to_string());
-            PgWireError::UserError(Box::new(info))
-        })?;
+    let result = client.get::<Row>(sql).await.map_err(|e| {
+        let info = crate::error_mapping::trino_error_to_pg(&e.to_string());
+        PgWireError::UserError(Box::new(info))
+    })?;
 
     // 2. Check for immediate error
     if let Some(error) = &result.error {
@@ -106,13 +109,10 @@ pub async fn execute_trino_query(
     while trino_columns.is_empty() {
         match next_uri.take() {
             Some(url) => {
-                let next_result = client
-                    .get_next::<Row>(&url)
-                    .await
-                    .map_err(|e| {
-                        let info = crate::error_mapping::trino_error_to_pg(&e.to_string());
-                        PgWireError::UserError(Box::new(info))
-                    })?;
+                let next_result = client.get_next::<Row>(&url).await.map_err(|e| {
+                    let info = crate::error_mapping::trino_error_to_pg(&e.to_string());
+                    PgWireError::UserError(Box::new(info))
+                })?;
 
                 if let Some(error) = &next_result.error {
                     let info = crate::error_mapping::trino_error_to_pg(&error.message);
@@ -136,7 +136,7 @@ pub async fn execute_trino_query(
     // of Response::Query.
     let schema = build_pg_schema(&trino_columns);
 
-    // 6. Create streaming bridge
+    // 5. Create streaming bridge
     let stream_client = Arc::clone(client);
     let stream_columns = trino_columns.clone();
     let stream_schema = schema.clone();

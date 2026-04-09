@@ -15,13 +15,13 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(Config::parse());
 
-    let factory = Arc::new(GatewayHandlerFactory {
-        startup: Arc::new(GatewayStartupHandler {
+    let factory = Arc::new(GatewayHandlerFactory::new(
+        Arc::new(GatewayStartupHandler {
             config: config.clone(),
         }),
-        query: Arc::new(GatewayQueryHandler),
-        extended_query: Arc::new(GatewayExtendedQueryHandler),
-    });
+        Arc::new(GatewayQueryHandler),
+        Arc::new(GatewayExtendedQueryHandler),
+    ));
 
     let listener = TcpListener::bind(&config.listen_addr).await?;
     tracing::info!(addr = %config.listen_addr, "listening for PostgreSQL connections");

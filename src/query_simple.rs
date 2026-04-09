@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::Sink;
-use pgwire::api::results::{QueryResponse, Response, Tag};
+use pgwire::api::results::Response;
 use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore};
 use pgwire::error::{PgWireError, PgWireResult};
@@ -12,7 +12,8 @@ use trino_rust_client::Client as TrinoClient;
 
 use pgwire::api::query::SimpleQueryHandler;
 
-use crate::trino_stream::execute_trino_query;
+use crate::config::Config;
+use crate::query_pipeline::process_query;
 
 /// Handles simple query protocol messages.
 #[derive(Debug)]
@@ -29,34 +30,16 @@ impl SimpleQueryHandler for GatewayQueryHandler {
     {
         tracing::debug!(query, "Received query");
 
-        // Static catalog interception (pg_type, pg_enum, pg_range, pg_namespace, etc.)
-        if let Some(result) = crate::intercept::intercept_query(query) {
-            return result;
-        }
-
         let trino_client: Arc<TrinoClient> = client
             .session_extensions()
             .get::<TrinoClient>()
             .ok_or_else(|| PgWireError::ApiError("No Trino client in session".into()))?;
 
-        // Dynamic catalog interception (pg_class, pg_attribute — needs Trino client)
-        if let Some(result) =
-            crate::catalog::handle_dynamic_catalog_query(query, &trino_client).await
-        {
-            return result;
-        }
+        let config: Arc<Config> = client
+            .session_extensions()
+            .get::<Config>()
+            .ok_or_else(|| PgWireError::ApiError("No Config in session".into()))?;
 
-        let rewritten = crate::rewrite::rewrite_sql(query);
-        tracing::debug!(original = query, rewritten = %rewritten, "Rewritten query");
-
-        let (schema, row_stream) =
-            execute_trino_query(&trino_client, rewritten).await?;
-
-        if schema.is_empty() {
-            // DDL/DML — no result set
-            Ok(vec![Response::Execution(Tag::new("OK"))])
-        } else {
-            Ok(vec![Response::Query(QueryResponse::new(schema, row_stream))])
-        }
+        process_query(query, &trino_client, &config).await
     }
 }

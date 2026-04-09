@@ -1,20 +1,13 @@
 use std::sync::Arc;
 
-use pgwire::api::results::{FieldFormat, FieldInfo, Response};
 use pgwire::api::Type;
+use pgwire::api::results::{FieldFormat, FieldInfo, Response};
 use pgwire::error::{PgWireError, PgWireResult};
 use trino_rust_client::{Client, Row};
 
 use super::build_response;
 use super::pg_class::table_oid;
 use crate::types::trino_type_to_pg;
-
-/// Map a pgwire `Type` to its PostgreSQL OID integer.
-///
-/// `postgres_types::Type` has an `oid()` method returning `Oid` (u32).
-fn pg_type_oid(ty: &Type) -> u32 {
-    ty.oid()
-}
 
 /// Query Trino's information_schema.columns and return a pg_attribute-compatible response.
 pub async fn respond_pg_attribute(client: &Arc<Client>) -> PgWireResult<Vec<Response>> {
@@ -81,27 +74,23 @@ pub async fn respond_pg_attribute(client: &Arc<Client>) -> PgWireResult<Vec<Resp
         let values = trino_row.into_json();
         // columns: table_schema (0), table_name (1), column_name (2),
         //          ordinal_position (3), is_nullable (4), data_type (5)
-        let schema_name = values
-            .first()
-            .and_then(|v| v.as_str())
-            .unwrap_or("public");
+        let schema_name = values.first().and_then(|v| v.as_str()).unwrap_or("public");
         let tbl_name = values.get(1).and_then(|v| v.as_str()).unwrap_or("");
         let col_name = values.get(2).and_then(|v| v.as_str()).unwrap_or("");
         let ordinal = values
             .get(3)
-            .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
             .unwrap_or(0);
         let is_nullable = values.get(4).and_then(|v| v.as_str()).unwrap_or("YES");
         let data_type = values.get(5).and_then(|v| v.as_str()).unwrap_or("varchar");
 
         let attrelid = table_oid(schema_name, tbl_name);
         let pg_type = trino_type_to_pg(data_type);
-        let atttypid = pg_type_oid(&pg_type);
-        let attnotnull = if is_nullable == "NO" {
-            "true"
-        } else {
-            "false"
-        };
+        let atttypid = pg_type.oid();
+        let attnotnull = if is_nullable == "NO" { "true" } else { "false" };
 
         rows.push(vec![
             Some(attrelid.to_string()),
@@ -118,33 +107,6 @@ pub async fn respond_pg_attribute(client: &Arc<Client>) -> PgWireResult<Vec<Resp
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn pg_type_oid_int4() {
-        assert_eq!(pg_type_oid(&Type::INT4), 23);
-    }
-
-    #[test]
-    fn pg_type_oid_varchar() {
-        assert_eq!(pg_type_oid(&Type::VARCHAR), 1043);
-    }
-
-    #[test]
-    fn pg_type_oid_bool() {
-        assert_eq!(pg_type_oid(&Type::BOOL), 16);
-    }
-
-    #[test]
-    fn pg_type_oid_text() {
-        assert_eq!(pg_type_oid(&Type::TEXT), 25);
-    }
-
-    #[test]
-    fn pg_type_oid_timestamp() {
-        assert_eq!(pg_type_oid(&Type::TIMESTAMP), 1114);
-    }
-
     #[test]
     fn attrelid_matches_pg_class_oid() {
         // The same (schema, table) pair must produce the same OID in both
