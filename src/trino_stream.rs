@@ -80,14 +80,15 @@ pub async fn execute_trino_query(
     let result = client
         .get::<Row>(sql)
         .await
-        .map_err(|e| PgWireError::ApiError(Box::new(e)))?;
+        .map_err(|e| {
+            let info = crate::error_mapping::trino_error_to_pg(&e.to_string());
+            PgWireError::UserError(Box::new(info))
+        })?;
 
     // 2. Check for immediate error
     if let Some(error) = &result.error {
-        return Err(PgWireError::ApiError(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Trino query error: {}", error.message),
-        ))));
+        let info = crate::error_mapping::trino_error_to_pg(&error.message);
+        return Err(PgWireError::UserError(Box::new(info)));
     }
 
     // 3. Extract column metadata
@@ -98,10 +99,10 @@ pub async fn execute_trino_query(
         .unwrap_or_default();
 
     if trino_columns.is_empty() {
-        return Err(PgWireError::ApiError(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
+        let info = crate::error_mapping::trino_error_to_pg(
             "Trino query returned no column metadata",
-        ))));
+        );
+        return Err(PgWireError::UserError(Box::new(info)));
     }
 
     // 4. Build PG schema
@@ -132,10 +133,8 @@ pub async fn execute_trino_query(
                 Ok(result) => {
                     // Check for Trino-side error
                     if let Some(error) = &result.error {
-                        yield Err(PgWireError::ApiError(Box::new(std::io::Error::new(
-                            std::io::ErrorKind::Other,
-                            format!("Trino query error: {}", error.message),
-                        ))));
+                        let info = crate::error_mapping::trino_error_to_pg(&error.message);
+                        yield Err(PgWireError::UserError(Box::new(info)));
                         break;
                     }
 
@@ -149,7 +148,8 @@ pub async fn execute_trino_query(
                     next_uri = result.next_uri;
                 }
                 Err(e) => {
-                    yield Err(PgWireError::ApiError(Box::new(e)));
+                    let info = crate::error_mapping::trino_error_to_pg(&e.to_string());
+                    yield Err(PgWireError::UserError(Box::new(info)));
                     break;
                 }
             }

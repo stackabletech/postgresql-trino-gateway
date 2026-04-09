@@ -1,5 +1,6 @@
 pub mod catalog;
 pub mod config;
+pub mod error_mapping;
 pub mod handler;
 pub mod intercept;
 pub mod query_extended;
