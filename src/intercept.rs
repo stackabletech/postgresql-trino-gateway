@@ -64,6 +64,11 @@ pub fn intercept_query(query: &str) -> Option<PgWireResult<Vec<Response>>> {
         return Some(resp);
     }
 
+    // pg_catalog queries (Npgsql type loading, etc.)
+    if let Some(resp) = crate::catalog::handle_catalog_query(trimmed) {
+        return Some(resp);
+    }
+
     None
 }
 
