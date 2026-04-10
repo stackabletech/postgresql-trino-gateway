@@ -76,7 +76,7 @@ pub fn intercept_query(
 
     // information_schema tables that don't exist in Trino — return empty results.
     // Power BI queries these for relationship/constraint discovery.
-    if let Some(resp) = intercept_missing_information_schema(&upper) {
+    if let Some(resp) = intercept_missing_information_schema(&upper, trimmed) {
         return Some(resp);
     }
 
@@ -85,7 +85,10 @@ pub fn intercept_query(
 
 /// Intercept queries against information_schema tables that Trino doesn't have.
 /// Returns empty result sets so the client proceeds without constraint data.
-fn intercept_missing_information_schema(upper: &str) -> Option<PgWireResult<Vec<Response>>> {
+fn intercept_missing_information_schema(
+    upper: &str,
+    query: &str,
+) -> Option<PgWireResult<Vec<Response>>> {
     let missing_tables = [
         "REFERENTIAL_CONSTRAINTS",
         "TABLE_CONSTRAINTS",
@@ -102,18 +105,75 @@ fn intercept_missing_information_schema(upper: &str) -> Option<PgWireResult<Vec<
                 table,
                 "Intercepting query for missing information_schema table"
             );
-            return Some(empty_query_response());
+            return Some(empty_query_response(query));
         }
     }
 
     None
 }
 
-/// Return an empty execution result (CommandComplete, no result set).
-/// Used for queries against tables that don't exist in Trino — the client
-/// gets a clean "0 rows affected" response rather than an error or null schema.
-fn empty_query_response() -> PgWireResult<Vec<Response>> {
-    Ok(vec![Response::Execution(Tag::new("SELECT").with_rows(0))])
+/// Return an empty result set with the column schema extracted from the query.
+/// Power BI's RetrieveRelationshipsForTable expects a real result set with
+/// typed columns (not just CommandComplete), even if it has zero rows.
+/// We parse the query to extract column aliases from the SELECT list.
+fn empty_query_response(query: &str) -> PgWireResult<Vec<Response>> {
+    use futures::stream;
+    use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse};
+
+    // Try to extract column names from the SELECT list
+    let columns = extract_select_columns(query);
+
+    let schema = Arc::new(
+        columns
+            .iter()
+            .map(|name| {
+                FieldInfo::new(
+                    name.clone(),
+                    None,
+                    None,
+                    pgwire::api::Type::VARCHAR,
+                    FieldFormat::Text,
+                )
+            })
+            .collect::<Vec<_>>(),
+    );
+
+    Ok(vec![Response::Query(QueryResponse::new(
+        schema,
+        stream::empty(),
+    ))])
+}
+
+/// Extract column names/aliases from a SELECT query.
+/// Falls back to generic column names if parsing fails.
+fn extract_select_columns(query: &str) -> Vec<String> {
+    use sqlparser::dialect::PostgreSqlDialect;
+    use sqlparser::parser::Parser;
+
+    let dialect = PostgreSqlDialect {};
+    let ast = match Parser::parse_sql(&dialect, query) {
+        Ok(ast) => ast,
+        Err(_) => return vec!["column".to_string()],
+    };
+
+    if let Some(sqlparser::ast::Statement::Query(q)) = ast.into_iter().next() {
+        if let sqlparser::ast::SetExpr::Select(select) = *q.body {
+            return select
+                .projection
+                .iter()
+                .map(|item| match item {
+                    sqlparser::ast::SelectItem::UnnamedExpr(expr) => expr.to_string(),
+                    sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    sqlparser::ast::SelectItem::Wildcard(_) => "*".to_string(),
+                    sqlparser::ast::SelectItem::QualifiedWildcard(name, _) => {
+                        format!("{name}.*")
+                    }
+                })
+                .collect();
+        }
+    }
+
+    vec!["column".to_string()]
 }
 
 fn intercept_transaction(upper: &str) -> Option<PgWireResult<Vec<Response>>> {
