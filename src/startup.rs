@@ -82,11 +82,8 @@ impl StartupHandler for GatewayStartupHandler {
                 } else {
                     // No auth — create Trino client immediately
                     let trino_client = self.build_trino_client(None, None)?;
-                    let conn_id = format!(
-                        "{}_{}",
-                        client.socket_addr(),
-                        client.pid_and_secret_key().0
-                    );
+                    let conn_id =
+                        format!("{}_{}", client.socket_addr(), client.pid_and_secret_key().0);
                     client
                         .metadata_mut()
                         .insert(session::connection_id_key().to_owned(), conn_id.clone());
@@ -125,11 +122,7 @@ impl StartupHandler for GatewayStartupHandler {
                     return Err(PgWireError::InvalidPassword(user));
                 }
 
-                let conn_id = format!(
-                    "{}_{}",
-                    client.socket_addr(),
-                    client.pid_and_secret_key().0
-                );
+                let conn_id = format!("{}_{}", client.socket_addr(), client.pid_and_secret_key().0);
                 client
                     .metadata_mut()
                     .insert(session::connection_id_key().to_owned(), conn_id.clone());

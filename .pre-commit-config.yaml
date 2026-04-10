@@ -1,0 +1,58 @@
+---
+default_language_version:
+  node: system
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: cef0300fd0fc4d2a87a85fa2093c6b283ea36f4b # 5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: detect-aws-credentials
+        args: ["--allow-missing-credentials"]
+      - id: detect-private-key
+
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: 192ad822316c3a22fb3d3cc8aa6eafa0b8488360 # 0.45.0
+    hooks:
+      - id: markdownlint
+
+  - repo: https://github.com/koalaman/shellcheck-precommit
+    rev: 2491238703a5d3415bb2b7ff11388bf775372f29 # 0.10.0
+    hooks:
+      - id: shellcheck
+        args: ["--severity=info"]
+
+  - repo: local
+    hooks:
+      - id: cargo-test
+        name: cargo-test
+        language: system
+        entry: cargo test
+        stages: [pre-commit, pre-merge-commit]
+        pass_filenames: false
+        files: \.rs$|Cargo\.(toml|lock)
+
+      - id: cargo-rustfmt
+        name: cargo-rustfmt
+        language: system
+        entry: cargo fmt --all -- --check
+        stages: [pre-commit, pre-merge-commit]
+        pass_filenames: false
+        files: \.rs$
+
+      - id: cargo-clippy
+        name: cargo-clippy
+        language: system
+        entry: cargo clippy -- -D warnings
+        stages: [pre-commit, pre-merge-commit]
+        pass_filenames: false
+        files: \.rs$
+
+      - id: cargo-deny
+        name: cargo-deny
+        language: system
+        entry: cargo deny check
+        stages: [pre-commit, pre-merge-commit]
+        pass_filenames: false
+        files: Cargo\.(toml|lock)|deny\.toml

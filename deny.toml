@@ -1,0 +1,53 @@
+# Cargo deny configuration for postgresql-trino-gateway
+# Run: cargo deny check
+
+[graph]
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+    { triple = "x86_64-unknown-linux-musl" },
+]
+
+[advisories]
+yanked = "deny"
+ignore = [
+    # https://rustsec.org/advisories/RUSTSEC-2024-0436
+    # The "paste" crate is no longer maintained. Transitive dependency via
+    # trino-rust-client. No direct usage in our code, minimal impact.
+    "RUSTSEC-2024-0436",
+]
+
+[bans]
+multiple-versions = "allow"
+
+[licenses]
+unused-allowed-license = "allow"
+confidence-threshold = 1.0
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "CC0-1.0",
+    "ISC",
+    "LicenseRef-ring",
+    "MIT",
+    "MPL-2.0",
+    "OpenSSL",
+    "OSL-3.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "Unlicense",
+]
+private = { ignore = true }
+
+[[licenses.clarify]]
+name = "ring"
+expression = "LicenseRef-ring"
+license-files = [
+    { path = "LICENSE", hash = 0xbd0eed23 },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

@@ -26,3 +26,8 @@ sqlparser = { version = "0.61", features = ["visitor"] }
 
 [dev-dependencies]
 tokio-postgres = "0.7"
+
+[lints.clippy]
+unwrap_in_result = "deny"
+unwrap_used = "deny"
+panic = "deny"
