@@ -37,4 +37,10 @@ pub struct Config {
     /// Skip TLS certificate verification (for self-signed certs).
     #[arg(long, default_value_t = false)]
     pub trino_ssl_insecure: bool,
+
+    /// Require password authentication from PG clients.
+    /// Credentials are forwarded to Trino as HTTP Basic auth.
+    /// When disabled, connects to Trino with the --trino-user and no password.
+    #[arg(long, default_value_t = false)]
+    pub auth: bool,
 }

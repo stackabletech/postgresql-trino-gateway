@@ -42,11 +42,19 @@ async fn start_gateway(config: Config) -> SocketAddr {
 }
 
 async fn connect(addr: SocketAddr) -> Client {
-    let conn_str = format!(
-        "host={} port={} user=trino dbname=test",
+    connect_as(addr, "trino", None).await
+}
+
+async fn connect_as(addr: SocketAddr, user: &str, password: Option<&str>) -> Client {
+    let mut conn_str = format!(
+        "host={} port={} user={} dbname=test",
         addr.ip(),
-        addr.port()
+        addr.port(),
+        user,
     );
+    if let Some(pw) = password {
+        conn_str.push_str(&format!(" password={pw}"));
+    }
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await.unwrap();
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -76,6 +84,7 @@ fn test_config() -> Config {
         trino_user: "trino".to_string(),
         trino_ssl: false,
         trino_ssl_insecure: false,
+        auth: false,
     }
 }
 
@@ -97,6 +106,7 @@ fn trino_config() -> Option<Config> {
         trino_user: "trino".to_string(),
         trino_ssl: ssl,
         trino_ssl_insecure: ssl_insecure,
+        auth: false,
     })
 }
 
@@ -944,4 +954,71 @@ async fn test_information_schema_passthrough() {
         rows.len() > 0,
         "information_schema.tables should return results"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Authentication tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_auth_disabled_allows_any_connection() {
+    let config = test_config(); // auth: false
+    let addr = start_gateway(config).await;
+
+    // Should connect without any password
+    let client = connect(addr).await;
+    let rows = extract_rows(client.simple_query("SELECT version()").await.unwrap());
+    assert!(!rows.is_empty());
+}
+
+#[tokio::test]
+async fn test_auth_enabled_requires_password() {
+    let mut config = test_config();
+    config.auth = true;
+    let addr = start_gateway(config).await;
+
+    // Connecting without a password should fail (server requests password,
+    // but tokio-postgres sends empty password which Trino will reject).
+    // The connection itself should fail or the first query should fail.
+    let conn_str = format!(
+        "host={} port={} user=trino dbname=test",
+        addr.ip(),
+        addr.port()
+    );
+    let result = tokio_postgres::connect(&conn_str, NoTls).await;
+    // With auth enabled and no reachable Trino, this should fail during
+    // the auth handshake (credential validation query to Trino fails).
+    assert!(
+        result.is_err(),
+        "Expected connection to fail without valid credentials"
+    );
+}
+
+/// This test requires Trino to have password authentication configured.
+/// Set TRINO_AUTH_ENABLED=true along with TRINO_HOST to run it.
+#[tokio::test]
+async fn test_auth_passthrough_to_trino() {
+    if std::env::var("TRINO_AUTH_ENABLED").ok().as_deref() != Some("true") {
+        eprintln!("Skipping: TRINO_AUTH_ENABLED not set (Trino needs password auth configured)");
+        return;
+    }
+    let config = match trino_config() {
+        Some(mut c) => {
+            c.auth = true;
+            c
+        }
+        None => {
+            eprintln!("Skipping: TRINO_HOST not set");
+            return;
+        }
+    };
+    let addr = start_gateway(config).await;
+
+    // Connect with valid credentials. The actual user/password depend on
+    // how Trino's password authentication is configured.
+    let user = std::env::var("TRINO_AUTH_USER").unwrap_or_else(|_| "trino".to_string());
+    let password = std::env::var("TRINO_AUTH_PASSWORD").unwrap_or_else(|_| "trino".to_string());
+    let client = connect_as(addr, &user, Some(&password)).await;
+    let rows = extract_rows(client.simple_query("SELECT 1").await.unwrap());
+    assert_eq!(rows.len(), 1);
 }
