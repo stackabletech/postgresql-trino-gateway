@@ -92,6 +92,7 @@ fn intercept_missing_information_schema(upper: &str) -> Option<PgWireResult<Vec<
         "KEY_COLUMN_USAGE",
         "CONSTRAINT_COLUMN_USAGE",
         "CONSTRAINT_TABLE_USAGE",
+        "CHARACTER_SETS",
         "CHECK_CONSTRAINTS",
     ];
 
