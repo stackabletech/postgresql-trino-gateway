@@ -27,7 +27,12 @@ async fn main() -> anyhow::Result<()> {
     ));
 
     let listener = TcpListener::bind(&config.listen_addr).await?;
-    tracing::info!(addr = %config.listen_addr, "listening for PostgreSQL connections");
+    tracing::info!(
+        addr = %config.listen_addr,
+        version = env!("CARGO_PKG_VERSION"),
+        built = env!("BUILD_TIMESTAMP"),
+        "listening for PostgreSQL connections"
+    );
 
     loop {
         let (socket, _addr) = listener.accept().await?;

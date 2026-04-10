@@ -24,6 +24,9 @@ async-stream = "0.3"
 dashmap = "6"
 sqlparser = { version = "0.61", features = ["visitor"] }
 
+[build-dependencies]
+chrono = "0.4"
+
 [dev-dependencies]
 tokio-postgres = "0.7"
 

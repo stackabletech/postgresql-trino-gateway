@@ -12,7 +12,7 @@ use pgwire::api::query::{ExtendedQueryHandler, send_execution_response, send_que
 use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, Type};
+use pgwire::api::{ClientInfo, ClientPortalStore, DEFAULT_NAME, Type};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 
@@ -89,7 +89,7 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let portal_name = message.name.as_deref().unwrap_or("");
+        let portal_name = message.name.as_deref().unwrap_or(DEFAULT_NAME);
         let max_rows = message.max_rows as usize;
 
         // For the common case (first execution, fetch all rows), handle it
