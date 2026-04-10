@@ -1,3 +1,6 @@
+// Copyright 2026 Stackable GmbH
+// Licensed under the Open Software License version 3.0 (OSL-3.0).
+// See LICENSE file in the project root for full license text.
 use std::sync::Arc;
 
 use pgwire::api::Type;
@@ -331,33 +334,33 @@ fn schema() -> Arc<Vec<FieldInfo>> {
             Type::VARCHAR,
             FieldFormat::Text,
         ),
-        FieldInfo::new("oid".to_owned(), None, None, Type::OID, FieldFormat::Text),
+        FieldInfo::new("oid".to_owned(), None, None, Type::INT4, FieldFormat::Text),
         FieldInfo::new(
             "typrelid".to_owned(),
             None,
             None,
-            Type::OID,
+            Type::INT4,
             FieldFormat::Text,
         ),
         FieldInfo::new(
             "typbasetype".to_owned(),
             None,
             None,
-            Type::OID,
+            Type::INT4,
             FieldFormat::Text,
         ),
         FieldInfo::new(
             "type".to_owned(),
             None,
             None,
-            Type::TEXT,
+            Type::VARCHAR,
             FieldFormat::Text,
         ),
         FieldInfo::new(
             "elemoid".to_owned(),
             None,
             None,
-            Type::OID,
+            Type::INT4,
             FieldFormat::Text,
         ),
         FieldInfo::new("ord".to_owned(), None, None, Type::INT4, FieldFormat::Text),
