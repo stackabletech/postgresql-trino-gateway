@@ -312,6 +312,9 @@ const ARRAY_TYPES: &[TypeEntry] = &[
 #[cfg(test)]
 const TYPE_ROW_COUNT: usize = BASE_TYPES.len() + PSEUDO_TYPES.len() + ARRAY_TYPES.len();
 
+/// Schema matching the JDBC PostgreSQL driver's type-loading query:
+///   SELECT ns.nspname, a.typname, a.oid, a.typrelid, a.typbasetype,
+///          CASE ... END AS type, CASE ... END AS elemoid, CASE ... END AS ord
 fn schema() -> Arc<Vec<FieldInfo>> {
     Arc::new(vec![
         FieldInfo::new(
@@ -321,7 +324,6 @@ fn schema() -> Arc<Vec<FieldInfo>> {
             Type::VARCHAR,
             FieldFormat::Text,
         ),
-        FieldInfo::new("oid".to_owned(), None, None, Type::INT4, FieldFormat::Text),
         FieldInfo::new(
             "typname".to_owned(),
             None,
@@ -329,38 +331,56 @@ fn schema() -> Arc<Vec<FieldInfo>> {
             Type::VARCHAR,
             FieldFormat::Text,
         ),
+        FieldInfo::new("oid".to_owned(), None, None, Type::INT4, FieldFormat::Text),
         FieldInfo::new(
-            "typtype".to_owned(),
+            "typrelid".to_owned(),
+            None,
+            None,
+            Type::INT4,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "typbasetype".to_owned(),
+            None,
+            None,
+            Type::INT4,
+            FieldFormat::Text,
+        ),
+        FieldInfo::new(
+            "type".to_owned(),
             None,
             None,
             Type::VARCHAR,
             FieldFormat::Text,
         ),
         FieldInfo::new(
-            "typnotnull".to_owned(),
-            None,
-            None,
-            Type::BOOL,
-            FieldFormat::Text,
-        ),
-        FieldInfo::new(
-            "elemtypoid".to_owned(),
+            "elemoid".to_owned(),
             None,
             None,
             Type::INT4,
             FieldFormat::Text,
         ),
+        FieldInfo::new("ord".to_owned(), None, None, Type::INT4, FieldFormat::Text),
     ])
 }
 
 fn entry_to_row(e: &TypeEntry) -> Vec<Option<String>> {
+    // ord: 0 = base types first, 1 = domains, 2 = ranges, 3 = arrays
+    let ord = match e.typtype {
+        "a" => "3",
+        "r" => "2",
+        "d" => "1",
+        _ => "0",
+    };
     vec![
-        Some("pg_catalog".to_owned()),
-        Some(e.oid.to_string()),
-        Some(e.typname.to_owned()),
-        Some(e.typtype.to_owned()),
-        Some("false".to_owned()),
-        Some(e.elemtypoid.to_string()),
+        Some("pg_catalog".to_owned()),  // nspname
+        Some(e.typname.to_owned()),     // typname
+        Some(e.oid.to_string()),        // oid
+        Some("0".to_owned()),           // typrelid (0 = not a composite)
+        Some("0".to_owned()),           // typbasetype (0 = not a domain)
+        Some(e.typtype.to_owned()),     // type
+        Some(e.elemtypoid.to_string()), // elemoid
+        Some(ord.to_owned()),           // ord
     ]
 }
 

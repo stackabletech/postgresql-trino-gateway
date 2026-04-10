@@ -293,7 +293,8 @@ async fn test_pg_type_catalog() {
     let rows = extract_rows(client.simple_query("SELECT * FROM pg_type").await.unwrap());
     assert!(rows.len() > 40, "expected >40 types, got {}", rows.len());
 
-    let type_names: Vec<&str> = rows.iter().map(|r| r.get(2).unwrap()).collect();
+    // typname is at column index 1 (schema: nspname, typname, oid, typrelid, typbasetype, type, elemoid, ord)
+    let type_names: Vec<&str> = rows.iter().map(|r| r.get(1).unwrap()).collect();
     for expected in [
         "bool",
         "int2",
