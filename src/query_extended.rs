@@ -137,18 +137,13 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
                 _ => {} // EmptyQuery, Transaction, Copy — rare for Trino gateway
             }
 
-            {
-                let state = portal.state();
-                let mut guard = state.lock().await;
-                *guard = pgwire::api::portal::PortalExecutionState::Finished;
-            }
+            // Do NOT set portal state to Finished or remove the portal.
+            // Npgsql pipelines multiple Parse/Bind/Execute sequences reusing
+            // the unnamed portal. Each Parse/Bind overwrites the previous one.
+            // pgwire's Sync handler cleans up portals at the end of the pipeline.
 
             client.set_state(PgWireConnectionState::ReadyForQuery);
             client.set_transaction_status(transaction_status);
-
-            if portal_name.is_empty() {
-                client.portal_store().rm_portal(portal_name);
-            }
 
             Ok(())
         } else {
