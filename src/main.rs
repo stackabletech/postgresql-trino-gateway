@@ -29,7 +29,7 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(&config.listen_addr).await?;
     tracing::info!(
         addr = %config.listen_addr,
-        version = env!("CARGO_PKG_VERSION"),
+        version = concat!(env!("CARGO_PKG_VERSION"), "-", env!("BUILD_GIT_HASH")),
         built = env!("BUILD_TIMESTAMP"),
         "listening for PostgreSQL connections"
     );
