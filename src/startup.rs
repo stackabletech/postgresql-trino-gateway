@@ -92,22 +92,22 @@ impl StartupHandler for GatewayStartupHandler {
                         .await?;
                 } else {
                     // No auth — create Trino client immediately
-                    let trino_client = self.build_trino_client(None, None)?;
+                    client.set_pid_and_secret_key(
+                        CONNECTION_PID.fetch_add(1, Ordering::Relaxed),
+                        SecretKey::I32(0),
+                    );
                     let conn_id =
                         format!("{}_{}", client.socket_addr(), client.pid_and_secret_key().0);
                     client
                         .metadata_mut()
                         .insert(session::connection_id_key().to_owned(), conn_id.clone());
+                    let trino_client = self.build_trino_client(None, None)?;
                     session::register_connection(
                         conn_id,
                         ConnectionState {
                             trino_client: Arc::new(trino_client),
                             config: self.config.clone(),
                         },
-                    );
-                    client.set_pid_and_secret_key(
-                        CONNECTION_PID.fetch_add(1, Ordering::Relaxed),
-                        SecretKey::I32(0),
                     );
                     finish_authentication(client, &GatewayParameterProvider).await?;
                     tracing::info!(addr = %client.socket_addr(), "client connected (no auth)");
@@ -137,6 +137,10 @@ impl StartupHandler for GatewayStartupHandler {
                     return Err(PgWireError::InvalidPassword(user));
                 }
 
+                client.set_pid_and_secret_key(
+                    CONNECTION_PID.fetch_add(1, Ordering::Relaxed),
+                    SecretKey::I32(0),
+                );
                 let conn_id = format!("{}_{}", client.socket_addr(), client.pid_and_secret_key().0);
                 client
                     .metadata_mut()
@@ -147,10 +151,6 @@ impl StartupHandler for GatewayStartupHandler {
                         trino_client: Arc::new(trino_client),
                         config: self.config.clone(),
                     },
-                );
-                client.set_pid_and_secret_key(
-                    CONNECTION_PID.fetch_add(1, Ordering::Relaxed),
-                    SecretKey::I32(0),
                 );
                 finish_authentication(client, &GatewayParameterProvider).await?;
                 tracing::info!(addr = %client.socket_addr(), user = %user, "client connected");

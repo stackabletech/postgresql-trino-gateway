@@ -284,6 +284,8 @@ async fn test_show_params() {
         ("transaction_isolation", "read committed"),
         ("in_hot_standby", "off"),
         ("default_transaction_read_only", "off"),
+        ("search_path", "\"$user\", public"),
+        ("application_name", ""),
     ];
 
     for (param, expected) in params {

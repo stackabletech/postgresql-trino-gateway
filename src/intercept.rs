@@ -220,6 +220,8 @@ fn intercept_show(trimmed: &str) -> PgWireResult<Vec<Response>> {
         "is_superuser" => "on",
         "in_hot_standby" => "off",
         "default_transaction_read_only" => "off",
+        "search_path" => "\"$user\", public",
+        "application_name" => "",
         _ => "on", // safe default
     };
 
