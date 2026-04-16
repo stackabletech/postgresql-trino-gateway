@@ -141,8 +141,10 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         let responses = process_query(query, &trino_client, &config).await?;
         let fields = match responses.into_iter().next() {
             Some(Response::Query(qr)) => {
-                let cols: Vec<&str> = qr.row_schema.iter().map(|f| f.name()).collect();
-                tracing::trace!(columns = ?cols, "Describe portal: returning RowDescription");
+                tracing::trace!(
+                    columns = ?qr.row_schema.iter().map(|f| f.name()).collect::<Vec<&str>>(),
+                    "Describe portal: returning RowDescription"
+                );
                 qr.row_schema.as_ref().clone()
             }
             _ => vec![], // DDL/DML — no columns

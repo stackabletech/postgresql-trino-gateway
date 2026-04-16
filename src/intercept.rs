@@ -83,7 +83,7 @@ pub fn intercept_query(
     // CHARACTER_SETS — Power BI queries this to confirm client encoding.
     // Real PostgreSQL returns one row: UTF8.
     if upper.contains("CHARACTER_SETS") {
-        tracing::trace!("Intercept: CHARACTER_SETS");
+        tracing::trace!(query = trimmed, "Intercept: CHARACTER_SETS");
         return Some(single_text_response("character_set_name", "UTF8"));
     }
 

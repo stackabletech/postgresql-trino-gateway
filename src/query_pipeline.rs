@@ -56,8 +56,10 @@ pub(crate) async fn process_query(
         // DDL/DML -- no result set
         Ok(vec![Response::Execution(Tag::new("OK"))])
     } else {
-        let col_names: Vec<&str> = schema.iter().map(|f| f.name()).collect();
-        tracing::trace!(columns = ?col_names, "Pipeline: Trino returned schema");
+        tracing::trace!(
+            columns = ?schema.iter().map(|f| f.name()).collect::<Vec<&str>>(),
+            "Pipeline: Trino returned schema"
+        );
         Ok(vec![Response::Query(QueryResponse::new(
             schema, row_stream,
         ))])
