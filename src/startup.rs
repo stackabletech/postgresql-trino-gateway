@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
 
 use async_trait::async_trait;
 use futures::sink::{Sink, SinkExt};
@@ -13,12 +14,16 @@ use pgwire::api::auth::{
 };
 use pgwire::api::{ClientInfo, PgWireConnectionState};
 use pgwire::error::{PgWireError, PgWireResult};
-use pgwire::messages::startup::Authentication;
+use pgwire::messages::startup::{Authentication, SecretKey};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use trino_rust_client::auth::Auth;
 
 use crate::config::Config;
 use crate::session::{self, ConnectionState};
+
+/// Monotonically-increasing connection counter used as the BackendKeyData PID.
+/// Starts at 1 so it is never zero (PID 0 means "not received" in Npgsql).
+static CONNECTION_PID: AtomicI32 = AtomicI32::new(1);
 
 /// Server parameter provider that returns PostgreSQL-compatible parameters.
 #[derive(Debug)]
@@ -94,6 +99,10 @@ impl StartupHandler for GatewayStartupHandler {
                             config: self.config.clone(),
                         },
                     );
+                    client.set_pid_and_secret_key(
+                        CONNECTION_PID.fetch_add(1, Ordering::Relaxed),
+                        SecretKey::I32(0),
+                    );
                     finish_authentication(client, &GatewayParameterProvider).await?;
                     tracing::info!(addr = %client.socket_addr(), "client connected (no auth)");
                 }
@@ -132,6 +141,10 @@ impl StartupHandler for GatewayStartupHandler {
                         trino_client: Arc::new(trino_client),
                         config: self.config.clone(),
                     },
+                );
+                client.set_pid_and_secret_key(
+                    CONNECTION_PID.fetch_add(1, Ordering::Relaxed),
+                    SecretKey::I32(0),
                 );
                 finish_authentication(client, &GatewayParameterProvider).await?;
                 tracing::info!(addr = %client.socket_addr(), user = %user, "client connected");

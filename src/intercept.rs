@@ -156,21 +156,21 @@ fn extract_select_columns(query: &str) -> Vec<String> {
         Err(_) => return vec!["column".to_string()],
     };
 
-    if let Some(sqlparser::ast::Statement::Query(q)) = ast.into_iter().next() {
-        if let sqlparser::ast::SetExpr::Select(select) = *q.body {
-            return select
-                .projection
-                .iter()
-                .map(|item| match item {
-                    sqlparser::ast::SelectItem::UnnamedExpr(expr) => expr.to_string(),
-                    sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-                    sqlparser::ast::SelectItem::Wildcard(_) => "*".to_string(),
-                    sqlparser::ast::SelectItem::QualifiedWildcard(name, _) => {
-                        format!("{name}.*")
-                    }
-                })
-                .collect();
-        }
+    if let Some(sqlparser::ast::Statement::Query(q)) = ast.into_iter().next()
+        && let sqlparser::ast::SetExpr::Select(select) = *q.body
+    {
+        return select
+            .projection
+            .iter()
+            .map(|item| match item {
+                sqlparser::ast::SelectItem::UnnamedExpr(expr) => expr.to_string(),
+                sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                sqlparser::ast::SelectItem::Wildcard(_) => "*".to_string(),
+                sqlparser::ast::SelectItem::QualifiedWildcard(name, _) => {
+                    format!("{name}.*")
+                }
+            })
+            .collect();
     }
 
     vec!["column".to_string()]
