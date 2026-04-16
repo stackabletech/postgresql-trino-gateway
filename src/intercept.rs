@@ -261,6 +261,60 @@ fn intercept_server_functions(
     None
 }
 
+/// Rewrite a `INFORMATION_SCHEMA.columns` query to translate Trino data-type
+/// names into PostgreSQL-style equivalents before forwarding to Trino.
+///
+/// Power BI sends a query with a `CASE WHEN data_type LIKE '%unsigned%' ...`
+/// expression. We replace that (and simpler bare `data_type` references) with
+/// a Trino CASE WHEN that maps type names like `double` → `double precision`.
+///
+/// Returns `None` if the query does not target `INFORMATION_SCHEMA.columns`.
+pub(crate) fn rewrite_info_schema_columns(query: &str) -> Option<String> {
+    let upper = query.to_uppercase();
+
+    // Only match queries whose primary table is INFORMATION_SCHEMA.COLUMNS.
+    if !upper.contains("FROM INFORMATION_SCHEMA.COLUMNS")
+        && !upper.contains("FROM INFORMATION_SCHEMA .COLUMNS")
+        && !upper.contains("FROM information_schema.columns")
+    {
+        return None;
+    }
+
+    let type_mapping = "\
+        CASE \
+        WHEN lower(data_type) = 'double' THEN 'double precision' \
+        WHEN lower(data_type) LIKE 'varchar%' THEN 'character varying' \
+        WHEN lower(data_type) LIKE 'char(%' THEN 'character' \
+        WHEN lower(data_type) LIKE '%timestamp%with time zone%' THEN 'timestamp with time zone' \
+        WHEN lower(data_type) LIKE 'timestamp%' THEN 'timestamp without time zone' \
+        WHEN lower(data_type) LIKE '%time%with time zone%' THEN 'time with time zone' \
+        WHEN lower(data_type) LIKE 'time%' THEN 'time without time zone' \
+        WHEN lower(data_type) LIKE 'decimal%' THEN 'numeric' \
+        WHEN lower(data_type) = 'varbinary' THEN 'bytea' \
+        ELSE data_type END";
+
+    // Detect the Power BI-specific CASE WHEN pattern (case-insensitive).
+    let powerbi_marker = "CASE WHEN (DATA_TYPE LIKE '%UNSIGNED%')";
+    if upper.contains(powerbi_marker) {
+        // Find the start of the CASE WHEN expression in the original query.
+        let start = upper.find(powerbi_marker)?;
+        // Find the end: look for "END AS DATA_TYPE" after the start position.
+        let end_marker = "END AS DATA_TYPE";
+        let end_pos = upper[start..].find(end_marker)?;
+        let end = start + end_pos + end_marker.len();
+
+        let before = &query[..start];
+        let after = &query[end..];
+        return Some(format!("{before}{type_mapping} AS DATA_TYPE{after}"));
+    }
+
+    // Fallback: wrap the whole query in a subquery with the type mapping.
+    Some(format!(
+        "SELECT COLUMN_NAME, ORDINAL_POSITION, IS_NULLABLE, {type_mapping} AS DATA_TYPE \
+         FROM ({query}) _col_inner"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,5 +434,61 @@ mod tests {
         assert_not_intercepted("SELECT * FROM users");
         assert_not_intercepted("INSERT INTO t VALUES (1)");
         assert_not_intercepted("CREATE TABLE t (id INT)");
+    }
+
+    #[test]
+    fn rewrite_info_schema_columns_rewrites_powerbi_pattern() {
+        let query = "select COLUMN_NAME, ORDINAL_POSITION, IS_NULLABLE, \
+            case when (data_type like '%unsigned%') then DATA_TYPE || ' unsigned' else DATA_TYPE end as DATA_TYPE \
+            from INFORMATION_SCHEMA.columns \
+            where TABLE_SCHEMA = 'sf1' and TABLE_NAME = 'orders' \
+            order by TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION";
+
+        let rewritten = rewrite_info_schema_columns(query)
+            .expect("should rewrite Power BI INFORMATION_SCHEMA.columns query");
+
+        // Must contain the type-mapping CASE WHEN
+        assert!(
+            rewritten.contains("lower(data_type)"),
+            "should contain type mapping: {rewritten}"
+        );
+        // Must preserve WHERE clause
+        assert!(
+            rewritten.contains("TABLE_SCHEMA = 'sf1'"),
+            "should preserve WHERE clause: {rewritten}"
+        );
+        // Must preserve table reference
+        assert!(
+            rewritten
+                .to_uppercase()
+                .contains("FROM INFORMATION_SCHEMA.COLUMNS"),
+            "should preserve FROM: {rewritten}"
+        );
+        // Must end with AS DATA_TYPE
+        assert!(
+            rewritten.contains("AS DATA_TYPE"),
+            "should have DATA_TYPE alias: {rewritten}"
+        );
+    }
+
+    #[test]
+    fn rewrite_info_schema_columns_leaves_other_tables_unchanged() {
+        assert!(
+            rewrite_info_schema_columns(
+                "SELECT * FROM INFORMATION_SCHEMA.tables WHERE TABLE_SCHEMA = 'sf1'"
+            )
+            .is_none(),
+            "tables query must not be rewritten"
+        );
+
+        assert!(
+            rewrite_info_schema_columns("SELECT * FROM pg_type").is_none(),
+            "pg_type query must not be rewritten"
+        );
+
+        assert!(
+            rewrite_info_schema_columns("SELECT 1").is_none(),
+            "plain query must not be rewritten"
+        );
     }
 }

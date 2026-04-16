@@ -29,6 +29,12 @@ pub(crate) async fn process_query(
         return result;
     }
 
+    // Rewrite INFORMATION_SCHEMA.columns DATA_TYPE to PostgreSQL-style type names.
+    let query = crate::intercept::rewrite_info_schema_columns(query)
+        .map(std::borrow::Cow::Owned)
+        .unwrap_or(std::borrow::Cow::Borrowed(query));
+    let query: &str = query.as_ref();
+
     let rewritten = crate::rewrite::rewrite_sql(query);
     tracing::debug!(original = query, rewritten = %rewritten, "Rewritten query");
 
