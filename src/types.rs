@@ -91,14 +91,76 @@ fn scalar_to_array(scalar: &Type) -> Type {
 /// Converts a JSON value to a PostgreSQL text-format string.
 ///
 /// Returns `None` for `Value::Null` (representing SQL NULL).
-pub fn encode_value(value: &Value, _trino_type: &str) -> Option<String> {
+///
+/// Numeric encoding is Trino-type-aware because `serde_json::Number::to_string`
+/// preserves the source JSON representation: a BIGINT serialized by Trino as
+/// `42.0` would render as `"42.0"`, which PostgreSQL's int8 text parser rejects.
+/// For integer target types we force integer form via `as_i64`/`as_u64` so the
+/// wire value always matches the declared column type.
+pub fn encode_value(value: &Value, trino_type: &str) -> Option<String> {
+    let base = base_type(trino_type);
     match value {
         Value::Null => None,
         Value::Bool(true) => Some("true".to_owned()),
         Value::Bool(false) => Some("false".to_owned()),
-        Value::Number(n) => Some(n.to_string()),
+        Value::Number(n) => Some(encode_number(n, base)),
         Value::String(s) => Some(s.clone()),
         Value::Array(_) | Value::Object(_) => Some(value.to_string()),
+    }
+}
+
+/// Extract the base Trino type name (e.g. `"varchar(25)"` → `"varchar"`).
+fn base_type(trino_type: &str) -> &str {
+    let trimmed = trino_type.trim();
+    match trimmed.find('(') {
+        Some(idx) => trimmed[..idx].trim(),
+        None => trimmed,
+    }
+}
+
+/// Render a JSON number as PostgreSQL text, respecting the declared type.
+///
+/// For integer targets, emit integer text regardless of how the JSON value was
+/// typed (Trino can legitimately serialize whole numbers as `42` or `42.0`).
+/// For floats, render NaN/Infinity using PostgreSQL's canonical forms.
+fn encode_number(n: &serde_json::Number, base: &str) -> String {
+    match base.to_lowercase().as_str() {
+        "tinyint" | "smallint" | "integer" | "bigint" => {
+            if let Some(i) = n.as_i64() {
+                return i.to_string();
+            }
+            if let Some(u) = n.as_u64() {
+                return u.to_string();
+            }
+            if let Some(f) = n.as_f64()
+                && f.is_finite()
+            {
+                return (f as i64).to_string();
+            }
+            n.to_string()
+        }
+        "real" | "double" => {
+            if let Some(f) = n.as_f64() {
+                return format_float_text(f);
+            }
+            n.to_string()
+        }
+        _ => n.to_string(),
+    }
+}
+
+/// PostgreSQL's canonical text form for f64 special values.
+fn format_float_text(f: f64) -> String {
+    if f.is_nan() {
+        "NaN".to_string()
+    } else if f.is_infinite() {
+        if f.is_sign_negative() {
+            "-Infinity".to_string()
+        } else {
+            "Infinity".to_string()
+        }
+    } else {
+        f.to_string()
     }
 }
 
@@ -319,6 +381,68 @@ mod tests {
     fn encode_float_number() {
         let val = serde_json::json!(3.14);
         assert_eq!(encode_value(&val, "double"), Some("3.14".to_owned()));
+    }
+
+    /// Regression: Trino can serialize a BIGINT whole number as JSON `42.0`;
+    /// naive `Number::to_string` would emit `"42.0"`, which PG's int8 text
+    /// parser rejects (it allows only decimal integer literals). Ensure we
+    /// render integer text for integer target types regardless of JSON form.
+    #[test]
+    fn encode_bigint_from_float_json() {
+        let val = serde_json::Value::Number(serde_json::Number::from_f64(42.0).unwrap());
+        assert_eq!(encode_value(&val, "bigint"), Some("42".to_owned()));
+    }
+
+    #[test]
+    fn encode_bigint_max() {
+        let val = serde_json::json!(9223372036854775807_i64);
+        assert_eq!(
+            encode_value(&val, "bigint"),
+            Some("9223372036854775807".to_owned())
+        );
+    }
+
+    #[test]
+    fn encode_bigint_as_string_passes_through() {
+        // Trino sometimes sends bigint as a JSON string to preserve precision.
+        let val = serde_json::json!("9223372036854775807");
+        assert_eq!(
+            encode_value(&val, "bigint"),
+            Some("9223372036854775807".to_owned())
+        );
+    }
+
+    #[test]
+    fn encode_real_nan_as_pg_text() {
+        let val = serde_json::Value::Number(
+            serde_json::Number::from_f64(f64::NAN)
+                .unwrap_or_else(|| serde_json::Number::from_f64(0.0).unwrap()),
+        );
+        // serde_json rejects NaN numbers; Trino sends them as the string "NaN".
+        // Verify string passthrough still works.
+        let _ = val;
+        let string_nan = serde_json::Value::String("NaN".to_owned());
+        assert_eq!(encode_value(&string_nan, "real"), Some("NaN".to_owned()));
+    }
+
+    #[test]
+    fn encode_real_infinity_from_string() {
+        let val = serde_json::Value::String("Infinity".to_owned());
+        assert_eq!(encode_value(&val, "real"), Some("Infinity".to_owned()));
+    }
+
+    #[test]
+    fn encode_real_normal_value() {
+        let val = serde_json::json!(3.14);
+        assert_eq!(encode_value(&val, "real"), Some("3.14".to_owned()));
+    }
+
+    #[test]
+    fn encode_integer_from_parsed_float_json() {
+        // `serde_json::from_str("42.0")` yields a Float-variant Number;
+        // our integer path must still render "42" for int8 target.
+        let val: serde_json::Value = serde_json::from_str("42.0").unwrap();
+        assert_eq!(encode_value(&val, "integer"), Some("42".to_owned()));
     }
 
     #[test]
