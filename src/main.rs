@@ -10,6 +10,7 @@ use postgresql_trino_gateway::config::Config;
 use postgresql_trino_gateway::handler::GatewayHandlerFactory;
 use postgresql_trino_gateway::query_extended::GatewayExtendedQueryHandler;
 use postgresql_trino_gateway::query_simple::GatewayQueryHandler;
+use postgresql_trino_gateway::session;
 use postgresql_trino_gateway::startup::GatewayStartupHandler;
 
 #[tokio::main]
@@ -35,11 +36,13 @@ async fn main() -> anyhow::Result<()> {
     );
 
     loop {
-        let (socket, _addr) = listener.accept().await?;
+        let (socket, peer_addr) = listener.accept().await?;
         let factory = factory.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = pgwire::tokio::process_socket(socket, None, factory).await {
+            let result = pgwire::tokio::process_socket(socket, None, factory).await;
+            session::remove_connections_for_addr(peer_addr);
+            if let Err(e) = result {
                 tracing::error!(error = %e, "connection error");
             }
         });
