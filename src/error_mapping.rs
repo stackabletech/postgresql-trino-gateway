@@ -5,11 +5,15 @@ use pgwire::error::ErrorInfo;
 
 /// Map a Trino error message to a PostgreSQL `ErrorInfo` with an appropriate SQLSTATE code.
 ///
-/// Trino error messages are parsed for known patterns (e.g. `SYNTAX_ERROR`,
-/// `TABLE_NOT_FOUND`) and translated into the closest PostgreSQL SQLSTATE code.
-/// See <https://www.postgresql.org/docs/current/errcodes-appendix.html>.
+/// SQLSTATE classification runs over the full original message — Java stack
+/// frames and internal class names contain useful keywords. The text returned
+/// to the client is then sanitised to drop Trino-internal class FQNs, stack
+/// traces, and hostnames in URLs.
+///
+/// The full (unsanitised) message is logged at `tracing::debug` so operators
+/// can correlate client-visible errors with the original Trino stack trace.
 pub fn trino_error_to_pg(error_msg: &str) -> ErrorInfo {
-    let upper = error_msg.to_uppercase();
+    let upper = error_msg.to_ascii_uppercase();
 
     let sqlstate = if upper.contains("SYNTAX_ERROR") || is_syntax_position(&upper) {
         "42601" // syntax_error
@@ -27,11 +31,82 @@ pub fn trino_error_to_pg(error_msg: &str) -> ErrorInfo {
         "42000" // syntax_error_or_access_rule_violation (generic)
     };
 
-    ErrorInfo::new(
-        "ERROR".to_owned(),
-        sqlstate.to_owned(),
-        error_msg.to_owned(),
-    )
+    let sanitised = sanitise_for_client(error_msg);
+    if sanitised != error_msg {
+        tracing::debug!(raw = %error_msg, "Trino error (full message redacted from client response)");
+    }
+
+    ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), sanitised)
+}
+
+/// Strip Trino-internal noise from an error message before sending it to the
+/// client.
+///
+/// What is removed:
+/// - Trailing Java stack traces beginning at `\n\tat ` or `\n  at `.
+/// - Leading Java exception class FQN like `io.trino.spi.TrinoException: `.
+/// - Hostnames inside `http://` and `https://` URLs (replaced with `<trino>`).
+///
+/// What is kept:
+/// - The user-facing error description (which may include the user's own SQL,
+///   table names from their query, and SQLSTATE-equivalent keywords).
+fn sanitise_for_client(msg: &str) -> String {
+    let truncated = msg
+        .find("\n\tat ")
+        .or_else(|| msg.find("\n  at "))
+        .map(|idx| &msg[..idx])
+        .unwrap_or(msg);
+
+    let prefix_stripped = strip_java_exception_prefix(truncated);
+    let urls_masked = mask_url_hosts(prefix_stripped);
+    urls_masked.trim().to_owned()
+}
+
+/// If `s` starts with a Java FQN ending in `Exception`/`Error` followed by
+/// `: `, drop the prefix. Recognised by a leading `io.`, `com.`, `java.`,
+/// or `org.` package path.
+fn strip_java_exception_prefix(s: &str) -> &str {
+    let Some(colon) = s.find(": ") else {
+        return s;
+    };
+    let prefix = &s[..colon];
+    let looks_like_package = prefix.starts_with("io.")
+        || prefix.starts_with("com.")
+        || prefix.starts_with("java.")
+        || prefix.starts_with("org.");
+    let looks_like_exception = prefix.ends_with("Exception") || prefix.ends_with("Error");
+    if looks_like_package && looks_like_exception && prefix.contains('.') {
+        s[colon + 2..].trim_start()
+    } else {
+        s
+    }
+}
+
+/// Replace the host portion of every `http://` or `https://` URL in `s` with
+/// the literal `<trino>`. Stops at the next `/`, whitespace, `)`, or `,`.
+/// Other Trino-side error messages occasionally include nextUri-style URLs.
+fn mask_url_hosts(s: &str) -> String {
+    const SCHEMES: &[&str] = &["https://", "http://"];
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    'outer: while !rest.is_empty() {
+        for scheme in SCHEMES {
+            if let Some(idx) = rest.find(scheme) {
+                out.push_str(&rest[..idx]);
+                out.push_str(scheme);
+                let after = &rest[idx + scheme.len()..];
+                let host_end = after
+                    .find(|c: char| c == '/' || c == ')' || c == ',' || c.is_whitespace())
+                    .unwrap_or(after.len());
+                out.push_str("<trino>");
+                rest = &after[host_end..];
+                continue 'outer;
+            }
+        }
+        out.push_str(rest);
+        break;
+    }
+    out
 }
 
 /// Detect Trino's positional syntax error pattern like "line 1:7:".
@@ -116,9 +191,67 @@ mod tests {
     }
 
     #[test]
-    fn preserves_original_message() {
+    fn preserves_original_message_when_clean() {
         let msg = "SYNTAX_ERROR: mismatched input 'SELECT'";
         let info = trino_error_to_pg(msg);
         assert_eq!(info.message, msg);
+    }
+
+    #[test]
+    fn strips_java_stack_trace() {
+        let msg = "io.trino.spi.TrinoException: Table 'memory.foo' does not exist\n\
+                   \tat io.trino.metadata.MetadataManager.resolveTableHandle(MetadataManager.java:412)\n\
+                   \tat io.trino.sql.analyzer.StatementAnalyzer.analyze(StatementAnalyzer.java:1234)";
+        let info = trino_error_to_pg(msg);
+        assert_eq!(info.message, "Table 'memory.foo' does not exist");
+        assert_eq!(info.code, "42P01");
+    }
+
+    #[test]
+    fn strips_java_exception_class_fqn() {
+        let msg = "io.trino.spi.security.AccessDeniedException: Access Denied: Cannot select from table foo.bar";
+        let info = trino_error_to_pg(msg);
+        assert_eq!(
+            info.message,
+            "Access Denied: Cannot select from table foo.bar"
+        );
+        assert_eq!(info.code, "42501");
+    }
+
+    #[test]
+    fn keeps_messages_without_java_prefix() {
+        let info = trino_error_to_pg("Column 'x' cannot be resolved");
+        assert_eq!(info.message, "Column 'x' cannot be resolved");
+    }
+
+    #[test]
+    fn masks_internal_hostnames_in_urls() {
+        let msg = "error sending request for url (https://internal-trino-coord.prod:8443/v1/statement/abc): connection refused";
+        let info = trino_error_to_pg(msg);
+        assert!(
+            !info.message.contains("internal-trino-coord"),
+            "hostname must be masked: {}",
+            info.message
+        );
+        assert!(info.message.contains("<trino>"));
+        assert!(info.message.contains("/v1/statement/abc"));
+    }
+
+    #[test]
+    fn masks_multiple_urls() {
+        let msg = "fetch from https://worker-1.cluster:8443/x failed, retried via http://worker-2.cluster:8443/x";
+        let info = trino_error_to_pg(msg);
+        assert!(!info.message.contains("worker-1.cluster"));
+        assert!(!info.message.contains("worker-2.cluster"));
+        assert_eq!(info.message.matches("<trino>").count(), 2);
+    }
+
+    #[test]
+    fn sqlstate_classification_uses_full_message() {
+        // Sanitisation drops `io.trino.spi.TrinoException`, but the
+        // SQLSTATE classifier still sees the keyword in the full string.
+        let msg = "io.trino.spi.security.AccessDeniedException: PERMISSION_DENIED: foo";
+        let info = trino_error_to_pg(msg);
+        assert_eq!(info.code, "42501");
     }
 }
