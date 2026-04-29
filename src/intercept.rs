@@ -273,11 +273,17 @@ fn intercept_server_functions(
 /// user input, so there is no injection risk; AST round-tripping a CASE
 /// expression of this complexity loses formatting in ways the rewrite itself
 /// is not robust to.
+///
+/// `to_ascii_uppercase` is deliberate: full Unicode `to_uppercase` can change
+/// byte length (e.g. Turkish `ı` (U+0131, 2 bytes) maps to `I` (1 byte)), and
+/// the splice below uses byte offsets that must remain valid in the original
+/// query. The marker itself is pure ASCII, so ASCII-only case folding is
+/// sufficient and preserves byte alignment.
 pub(crate) fn rewrite_info_schema_columns(query: &str, inspect: &ParsedQuery) -> Option<String> {
     if !inspect.references_table_in_schema("information_schema", "columns") {
         return None;
     }
-    let upper = query.to_uppercase();
+    let upper = query.to_ascii_uppercase();
 
     let type_mapping = "\
         CASE \
@@ -512,6 +518,35 @@ mod tests {
                 "should not rewrite: {q}"
             );
         }
+    }
+
+    /// Regression: non-ASCII content in a string literal before the Power BI
+    /// marker would shift byte offsets if we used Unicode `to_uppercase`
+    /// (e.g. Turkish `ı` (U+0131, 2 bytes) maps to `I` (1 byte)). With
+    /// `to_ascii_uppercase` the indices stay aligned and the splice produces
+    /// well-formed SQL.
+    #[test]
+    fn rewrite_info_schema_columns_handles_non_ascii_literals() {
+        let query = "select COLUMN_NAME, /* başlık ı ß */ \
+            case when (data_type like '%unsigned%') then DATA_TYPE || ' unsigned' else DATA_TYPE end as DATA_TYPE \
+            from INFORMATION_SCHEMA.columns where TABLE_NAME = 'orders'";
+
+        let inspect = ParsedQuery::new(query);
+        let rewritten = rewrite_info_schema_columns(query, &inspect)
+            .expect("rewrite must trigger on INFORMATION_SCHEMA.columns");
+
+        assert!(
+            rewritten.contains("/* başlık ı ß */"),
+            "non-ASCII content must round-trip intact: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("lower(data_type)"),
+            "type-mapping CASE must be present: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("AS DATA_TYPE"),
+            "AS DATA_TYPE alias must be preserved: {rewritten}"
+        );
     }
 
     /// Regression: a user table named `columns` in a non-information_schema
