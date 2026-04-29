@@ -111,6 +111,7 @@ impl StartupHandler for GatewayStartupHandler {
                         ConnectionState {
                             trino_client: Arc::new(trino_client),
                             config: self.config.clone(),
+                            portals: Default::default(),
                         },
                     );
                     finish_authentication(client, &GatewayParameterProvider).await?;
@@ -158,6 +159,7 @@ impl StartupHandler for GatewayStartupHandler {
                     ConnectionState {
                         trino_client: Arc::new(trino_client),
                         config: self.config.clone(),
+                        portals: Default::default(),
                     },
                 );
                 finish_authentication(client, &GatewayParameterProvider).await?;

@@ -1,13 +1,24 @@
 // Copyright 2026 Stackable GmbH
 // Licensed under the Open Software License version 3.0 (OSL-3.0).
 // See LICENSE file in the project root for full license text.
+use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use dashmap::DashMap;
+use pgwire::api::results::Response;
 use trino_rust_client::Client as TrinoClient;
 
 use crate::config::Config;
+
+/// Pipeline responses produced by `do_describe_portal` and consumed by
+/// `do_query`, keyed by portal name.
+///
+/// Wrapped in `Arc<Mutex<...>>` (rather than a `DashMap`) because `Response`
+/// contains a `dyn Stream + Send` that isn't `Sync`. Concurrent access within
+/// one connection isn't required — pgwire processes a connection's messages
+/// serially — so a single mutex is fine.
+pub type PortalCache = Arc<Mutex<HashMap<String, Response>>>;
 
 /// Per-connection state keyed by `{peer_addr}_{pid}` in `CONNECTIONS`.
 ///
@@ -17,6 +28,11 @@ use crate::config::Config;
 pub struct ConnectionState {
     pub trino_client: Arc<TrinoClient>,
     pub config: Arc<Config>,
+    /// Pipeline result produced by `do_describe_portal`, taken by `do_query`
+    /// so the query runs against Trino once per Describe+Execute pair instead
+    /// of twice. Orphaned entries (Describe with no Execute) are freed when
+    /// the connection's state is removed.
+    pub portals: PortalCache,
 }
 
 static CONNECTIONS: LazyLock<DashMap<String, ConnectionState>> = LazyLock::new(DashMap::new);
@@ -74,6 +90,7 @@ mod tests {
                 trino_ssl_insecure: false,
                 auth: false,
             }),
+            portals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 

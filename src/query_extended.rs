@@ -26,9 +26,11 @@ use crate::session;
 /// it gets RowDescription from Describe Portal and rejects a second one during Execute
 /// with "Received unexpected backend message RowDescription".
 ///
-/// Our `do_describe_portal` runs the full query pipeline to return the real column
-/// schema. This means Trino queries execute twice (Describe + Execute), but ensures
-/// the client always has the correct schema before data arrives.
+/// `do_describe_portal` runs the query pipeline to obtain the real column schema and
+/// stashes the result in the per-connection `portals` map; `do_query` takes the
+/// stashed response so the query runs against Trino exactly once per Describe+Execute
+/// pair, not twice. Critically this means side-effecting statements (INSERT, UPDATE,
+/// CREATE) issued via prepared statement run only once.
 #[derive(Debug)]
 pub struct GatewayExtendedQueryHandler;
 
@@ -64,6 +66,18 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
 
         let conn_state = session::get_connection(&conn_id)
             .ok_or_else(|| PgWireError::ApiError("Connection state not found".into()))?;
+
+        // Take the response stashed by do_describe_portal. If present, the
+        // query has already run against Trino — return it directly.
+        let cached = match conn_state.portals.lock() {
+            Ok(mut map) => map.remove(&portal.name),
+            Err(poisoned) => poisoned.into_inner().remove(&portal.name),
+        };
+        if let Some(cached) = cached {
+            tracing::trace!(conn_id = %conn_id, portal = %portal.name, "Extended query execute: served from describe cache");
+            return Ok(cached);
+        }
+
         let trino_client = Arc::clone(&conn_state.trino_client);
         let config = Arc::clone(&conn_state.config);
         drop(conn_state);
@@ -74,11 +88,11 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
             .next()
             .ok_or_else(|| PgWireError::ApiError("Empty pipeline response".into()))?;
         match &response {
-            pgwire::api::results::Response::Query(qr) => {
-                tracing::trace!(conn_id = %conn_id, columns = qr.row_schema.len(), "Extended query execute: query response");
+            Response::Query(qr) => {
+                tracing::trace!(conn_id = %conn_id, columns = qr.row_schema.len(), "Extended query execute: query response (no cache)");
             }
-            pgwire::api::results::Response::Execution(_tag) => {
-                tracing::trace!(conn_id = %conn_id, "Extended query execute: execution response");
+            Response::Execution(_tag) => {
+                tracing::trace!(conn_id = %conn_id, "Extended query execute: execution response (no cache)");
             }
             _ => {}
         }
@@ -121,9 +135,8 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        // Run the full query pipeline to extract the real column schema.
-        // This is called by pgjdbc BEFORE Execute, so the client gets
-        // RowDescription from here and then DataRow from Execute.
+        // Run the pipeline once, return the schema, and stash the response so
+        // do_query can serve Execute without re-running.
         let query = &portal.statement.statement;
 
         let conn_id = client
@@ -136,11 +149,19 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
             .ok_or_else(|| PgWireError::ApiError("Connection state not found".into()))?;
         let trino_client = Arc::clone(&conn_state.trino_client);
         let config = Arc::clone(&conn_state.config);
+        // Clone the Arc so we can stash the result after the .await below;
+        // conn_state is a DashMap ref-guard that can't be held across awaits.
+        let portals = Arc::clone(&conn_state.portals);
         drop(conn_state);
 
         let responses = process_query(query, &trino_client, &config).await?;
-        let fields = match responses.into_iter().next() {
-            Some(Response::Query(qr)) => {
+        let response = responses
+            .into_iter()
+            .next()
+            .ok_or_else(|| PgWireError::ApiError("Empty pipeline response".into()))?;
+
+        let fields = match &response {
+            Response::Query(qr) => {
                 tracing::trace!(
                     columns = ?qr.row_schema.iter().map(|f| f.name()).collect::<Vec<&str>>(),
                     "Describe portal: returning RowDescription"
@@ -149,6 +170,17 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
             }
             _ => vec![], // DDL/DML — no columns
         };
+
+        // Stash for do_query. Overwrites any stale entry from a prior Bind
+        // on the same portal name without a matching Execute.
+        match portals.lock() {
+            Ok(mut map) => {
+                map.insert(portal.name.clone(), response);
+            }
+            Err(poisoned) => {
+                poisoned.into_inner().insert(portal.name.clone(), response);
+            }
+        }
 
         Ok(DescribePortalResponse::new(fields))
     }
