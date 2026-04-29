@@ -3,15 +3,23 @@
 // See LICENSE file in the project root for full license text.
 use pgwire::error::ErrorInfo;
 
+/// Maximum length of the sanitised error message returned to the client.
+/// Trino errors with long single-line messages (e.g. catalogs of identifiers
+/// in a "Function not found" error) can otherwise reach kilobytes; sending a
+/// 30 KB error to a UI client is hostile.
+const MAX_CLIENT_ERROR_LEN: usize = 512;
+
 /// Map a Trino error message to a PostgreSQL `ErrorInfo` with an appropriate SQLSTATE code.
 ///
 /// SQLSTATE classification runs over the full original message — Java stack
 /// frames and internal class names contain useful keywords. The text returned
 /// to the client is then sanitised to drop Trino-internal class FQNs, stack
-/// traces, and hostnames in URLs.
+/// traces, hostnames in URLs, and is capped at `MAX_CLIENT_ERROR_LEN` bytes.
 ///
-/// The full (unsanitised) message is logged at `tracing::debug` so operators
-/// can correlate client-visible errors with the original Trino stack trace.
+/// We do NOT log the raw message: Trino error messages can embed literal
+/// values from the user's data ("Cannot cast '2024-foo' as DATE"), and
+/// AGENTS.md prohibits logging row contents. Operators needing the full
+/// stack trace should look at Trino's own logs.
 pub fn trino_error_to_pg(error_msg: &str) -> ErrorInfo {
     let upper = error_msg.to_ascii_uppercase();
 
@@ -31,12 +39,11 @@ pub fn trino_error_to_pg(error_msg: &str) -> ErrorInfo {
         "42000" // syntax_error_or_access_rule_violation (generic)
     };
 
-    let sanitised = sanitise_for_client(error_msg);
-    if sanitised != error_msg {
-        tracing::debug!(raw = %error_msg, "Trino error (full message redacted from client response)");
-    }
-
-    ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), sanitised)
+    ErrorInfo::new(
+        "ERROR".to_owned(),
+        sqlstate.to_owned(),
+        sanitise_for_client(error_msg),
+    )
 }
 
 /// Strip Trino-internal noise from an error message before sending it to the
@@ -44,12 +51,19 @@ pub fn trino_error_to_pg(error_msg: &str) -> ErrorInfo {
 ///
 /// What is removed:
 /// - Trailing Java stack traces beginning at `\n\tat ` or `\n  at `.
-/// - Leading Java exception class FQN like `io.trino.spi.TrinoException: `.
+/// - Leading Java exception class FQNs like `io.trino.spi.TrinoException: `.
+///   Trino sometimes wraps exceptions, so the strip is repeated until no
+///   further FQN is found.
 /// - Hostnames inside `http://` and `https://` URLs (replaced with `<trino>`).
 ///
-/// What is kept:
-/// - The user-facing error description (which may include the user's own SQL,
-///   table names from their query, and SQLSTATE-equivalent keywords).
+/// The result is capped at `MAX_CLIENT_ERROR_LEN` bytes.
+///
+/// What is intentionally kept (informational, not sensitive):
+/// - The user-facing error description, which may include the user's own
+///   SQL, identifiers from their query, and any SQLSTATE-equivalent keywords.
+/// - Bare hostnames or IPs that appear outside URLs (e.g. "Worker 10.0.0.5
+///   unreachable") — masking these without false positives requires a
+///   regex-grade matcher, and the URL form is the common case for Trino.
 fn sanitise_for_client(msg: &str) -> String {
     let truncated = msg
         .find("\n\tat ")
@@ -57,9 +71,33 @@ fn sanitise_for_client(msg: &str) -> String {
         .map(|idx| &msg[..idx])
         .unwrap_or(msg);
 
-    let prefix_stripped = strip_java_exception_prefix(truncated);
+    let mut prefix_stripped = truncated;
+    loop {
+        let next = strip_java_exception_prefix(prefix_stripped);
+        if std::ptr::eq(next, prefix_stripped) {
+            break;
+        }
+        prefix_stripped = next;
+    }
     let urls_masked = mask_url_hosts(prefix_stripped);
-    urls_masked.trim().to_owned()
+    let mut out = urls_masked.trim().to_owned();
+    truncate_with_ellipsis(&mut out, MAX_CLIENT_ERROR_LEN);
+    out
+}
+
+/// Truncate `s` to at most `max` bytes, ending on a UTF-8 char boundary, and
+/// append `…` when truncation occurred. No-op if `s` already fits.
+fn truncate_with_ellipsis(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    // Ellipsis is 3 bytes; reserve room for it inside the budget.
+    let mut cut = max.saturating_sub(3);
+    while cut > 0 && !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    s.push('…');
 }
 
 /// If `s` starts with a Java FQN ending in `Exception`/`Error` followed by
@@ -75,7 +113,7 @@ fn strip_java_exception_prefix(s: &str) -> &str {
         || prefix.starts_with("java.")
         || prefix.starts_with("org.");
     let looks_like_exception = prefix.ends_with("Exception") || prefix.ends_with("Error");
-    if looks_like_package && looks_like_exception && prefix.contains('.') {
+    if looks_like_package && looks_like_exception {
         s[colon + 2..].trim_start()
     } else {
         s
@@ -253,5 +291,39 @@ mod tests {
         let msg = "io.trino.spi.security.AccessDeniedException: PERMISSION_DENIED: foo";
         let info = trino_error_to_pg(msg);
         assert_eq!(info.code, "42501");
+    }
+
+    #[test]
+    fn strips_nested_exception_wrappers() {
+        let msg = "io.trino.spi.TrinoException: io.trino.spi.PrestoException: Table 'foo' does not exist";
+        let info = trino_error_to_pg(msg);
+        assert_eq!(info.message, "Table 'foo' does not exist");
+    }
+
+    #[test]
+    fn caps_oversized_messages() {
+        let huge = format!("Error: {}", "x".repeat(10_000));
+        let info = trino_error_to_pg(&huge);
+        assert!(
+            info.message.len() <= MAX_CLIENT_ERROR_LEN,
+            "expected <= {} bytes, got {}",
+            MAX_CLIENT_ERROR_LEN,
+            info.message.len()
+        );
+        assert!(
+            info.message.ends_with('…'),
+            "truncated message should end with ellipsis"
+        );
+    }
+
+    #[test]
+    fn truncate_respects_char_boundary() {
+        // Pad with non-ASCII so the naive byte-cut would fall mid-character.
+        let mut s = "ä".repeat(300); // each 'ä' is 2 bytes -> 600 bytes total
+        truncate_with_ellipsis(&mut s, 50);
+        assert!(s.len() <= 50);
+        // Must still be valid UTF-8 (the test framework would have already
+        // panicked if String::truncate had cut a code point).
+        assert!(s.ends_with('…'));
     }
 }
