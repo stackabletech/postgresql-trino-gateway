@@ -12,8 +12,8 @@
 use std::ops::ControlFlow;
 
 use sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, ObjectNamePart, Statement, Value,
-    visit_expressions, visit_relations,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, ObjectNamePart, Select,
+    SelectItem, SetExpr, Statement, Value, visit_expressions, visit_relations,
 };
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
@@ -138,6 +138,11 @@ impl ParsedQuery {
 
     /// First string-literal argument passed to a call of `name`, or `None` if
     /// no such call exists or the first argument isn't a string literal.
+    ///
+    /// Returns the *first* match in sqlparser's traversal order. Callers that
+    /// need to disambiguate multiple calls (e.g. `SELECT current_setting('a'),
+    /// current_setting('b')`) should gate on `is_bare_scalar_select` first so
+    /// the AST contains only a single expression.
     pub fn function_string_arg(&self, name: &str) -> Option<String> {
         let stmts = self.parsed.as_ref()?;
         let mut found: Option<String> = None;
@@ -153,9 +158,98 @@ impl ParsedQuery {
         });
         found
     }
+
+    /// True if the query is `SELECT <expr> [AS alias]` with no FROM, WHERE,
+    /// GROUP BY, ORDER BY, or other clauses, and exactly one projection item.
+    ///
+    /// Used to gate server-function intercepts so a column reference like
+    /// `WHERE current_schema = 'public'` or a multi-call projection like
+    /// `SELECT current_setting('a'), current_setting('b')` is not misrouted
+    /// to a single-row stub response.
+    pub fn is_bare_scalar_select(&self) -> bool {
+        self.bare_select().is_some()
+    }
+
+    /// Project name aliases of the single SELECT statement, or empty on parse
+    /// failure or non-SELECT statements. Used to synthesise empty result-set
+    /// schemas for intercepted information_schema queries.
+    pub fn select_column_names(&self) -> Vec<String> {
+        let Some(stmts) = self.parsed.as_ref() else {
+            return Vec::new();
+        };
+        let Some(Statement::Query(q)) = stmts.first() else {
+            return Vec::new();
+        };
+        let SetExpr::Select(select) = q.body.as_ref() else {
+            return Vec::new();
+        };
+        select
+            .projection
+            .iter()
+            .map(|item| match item {
+                SelectItem::UnnamedExpr(expr) => unnamed_select_name(expr),
+                SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                SelectItem::Wildcard(_) => "*".to_string(),
+                SelectItem::QualifiedWildcard(name, _) => format!("{name}.*"),
+            })
+            .collect()
+    }
+
+    fn bare_select(&self) -> Option<&Select> {
+        let stmts = self.parsed.as_ref()?;
+        if stmts.len() != 1 {
+            return None;
+        }
+        let Statement::Query(q) = &stmts[0] else {
+            return None;
+        };
+        if q.with.is_some() || q.order_by.is_some() || q.limit_clause.is_some() || q.fetch.is_some()
+        {
+            return None;
+        }
+        let SetExpr::Select(select) = q.body.as_ref() else {
+            return None;
+        };
+        let has_group_by = match &select.group_by {
+            GroupByExpr::Expressions(exprs, mods) => !exprs.is_empty() || !mods.is_empty(),
+            GroupByExpr::All(_) => true,
+        };
+        if !select.from.is_empty()
+            || select.selection.is_some()
+            || has_group_by
+            || select.having.is_some()
+            || !select.cluster_by.is_empty()
+            || !select.distribute_by.is_empty()
+            || !select.sort_by.is_empty()
+            || select.qualify.is_some()
+            || select.projection.len() != 1
+        {
+            return None;
+        }
+        Some(select)
+    }
 }
 
-
+/// Default column name PostgreSQL assigns to an unaliased SELECT expression.
+/// PG strips the qualifier from `t.col` and uses the trailing identifier; for
+/// other expression shapes it falls back to `?column?`.
+fn unnamed_select_name(expr: &Expr) -> String {
+    match expr {
+        Expr::Identifier(id) => id.value.clone(),
+        Expr::CompoundIdentifier(parts) => parts
+            .last()
+            .map(|p| p.value.clone())
+            .unwrap_or_else(|| "?column?".to_string()),
+        Expr::Function(f) => f
+            .name
+            .0
+            .last()
+            .and_then(|p| p.as_ident())
+            .map(|id| id.value.clone())
+            .unwrap_or_else(|| "?column?".to_string()),
+        _ => "?column?".to_string(),
+    }
+}
 
 fn last_ident_eq(parts: &[ObjectNamePart], want: &str) -> bool {
     parts
@@ -170,8 +264,14 @@ fn first_string_literal_arg(args: &FunctionArguments) -> Option<&str> {
     };
     let expr = match list.args.first()? {
         FunctionArg::Unnamed(FunctionArgExpr::Expr(e)) => e,
-        FunctionArg::Named { arg: FunctionArgExpr::Expr(e), .. } => e,
-        FunctionArg::ExprNamed { arg: FunctionArgExpr::Expr(e), .. } => e,
+        FunctionArg::Named {
+            arg: FunctionArgExpr::Expr(e),
+            ..
+        } => e,
+        FunctionArg::ExprNamed {
+            arg: FunctionArgExpr::Expr(e),
+            ..
+        } => e,
         _ => return None,
     };
     if let Expr::Value(v) = expr
@@ -202,8 +302,7 @@ mod tests {
 
     #[test]
     fn references_table_matches_join() {
-        let q =
-            ParsedQuery::new("SELECT a.attname FROM pg_attribute a JOIN pg_type t ON true");
+        let q = ParsedQuery::new("SELECT a.attname FROM pg_attribute a JOIN pg_type t ON true");
         assert!(q.references_table("pg_attribute"));
         assert!(q.references_table("pg_type"));
     }
@@ -223,9 +322,8 @@ mod tests {
 
     #[test]
     fn references_table_information_schema() {
-        let q = ParsedQuery::new(
-            "SELECT * FROM INFORMATION_SCHEMA.columns WHERE TABLE_SCHEMA = 'sf1'",
-        );
+        let q =
+            ParsedQuery::new("SELECT * FROM INFORMATION_SCHEMA.columns WHERE TABLE_SCHEMA = 'sf1'");
         assert!(q.references_table("columns"));
         assert!(!q.references_table("tables"));
     }
@@ -319,5 +417,64 @@ mod tests {
     fn function_string_arg_none_for_non_literal() {
         let q = ParsedQuery::new("SELECT current_setting(name)");
         assert_eq!(q.function_string_arg("current_setting"), None);
+    }
+
+    #[test]
+    fn is_bare_scalar_select_simple_function() {
+        assert!(ParsedQuery::new("SELECT version()").is_bare_scalar_select());
+        assert!(ParsedQuery::new("SELECT current_schema").is_bare_scalar_select());
+        assert!(ParsedQuery::new("SELECT current_setting('x')").is_bare_scalar_select());
+        assert!(ParsedQuery::new("SELECT version() AS v").is_bare_scalar_select());
+    }
+
+    #[test]
+    fn is_bare_scalar_select_rejects_from() {
+        assert!(!ParsedQuery::new("SELECT version() FROM t").is_bare_scalar_select());
+    }
+
+    #[test]
+    fn is_bare_scalar_select_rejects_where() {
+        // WHERE without FROM doesn't parse, but a column reference in WHERE
+        // alongside a FROM should reject. Test with FROM + WHERE.
+        let q = ParsedQuery::new("SELECT 1 FROM t WHERE current_schema = 'public'");
+        assert!(!q.is_bare_scalar_select());
+    }
+
+    #[test]
+    fn is_bare_scalar_select_rejects_multiple_projections() {
+        let q = ParsedQuery::new("SELECT current_setting('a'), current_setting('b')");
+        assert!(!q.is_bare_scalar_select());
+    }
+
+    #[test]
+    fn is_bare_scalar_select_rejects_cte() {
+        let q = ParsedQuery::new("WITH t AS (SELECT 1) SELECT version()");
+        assert!(!q.is_bare_scalar_select());
+    }
+
+    #[test]
+    fn is_bare_scalar_select_rejects_multi_statement() {
+        // sqlparser may or may not parse multi-statement strings; either way,
+        // bare-scalar must reject.
+        let q = ParsedQuery::new("SELECT version(); SELECT 1");
+        assert!(!q.is_bare_scalar_select());
+    }
+
+    #[test]
+    fn select_column_names_unaliased() {
+        let q = ParsedQuery::new("SELECT a, b.c FROM t");
+        assert_eq!(q.select_column_names(), vec!["a", "c"]);
+    }
+
+    #[test]
+    fn select_column_names_aliased() {
+        let q = ParsedQuery::new("SELECT 1 AS x, foo() AS y FROM t");
+        assert_eq!(q.select_column_names(), vec!["x", "y"]);
+    }
+
+    #[test]
+    fn select_column_names_complex_expressions_use_question_mark() {
+        let q = ParsedQuery::new("SELECT 1 + 2 FROM t");
+        assert_eq!(q.select_column_names(), vec!["?column?"]);
     }
 }

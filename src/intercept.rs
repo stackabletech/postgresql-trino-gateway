@@ -87,7 +87,7 @@ pub fn intercept_query(
 
     // information_schema tables that don't exist in Trino — empty result with
     // the right shape so Power BI can finish its constraint discovery.
-    if let Some(resp) = intercept_missing_information_schema(inspect, trimmed) {
+    if let Some(resp) = intercept_missing_information_schema(inspect) {
         return Some(resp);
     }
 
@@ -99,7 +99,6 @@ pub fn intercept_query(
 /// constraint data.
 fn intercept_missing_information_schema(
     inspect: &ParsedQuery,
-    query: &str,
 ) -> Option<PgWireResult<Vec<Response>>> {
     const MISSING_TABLES: &[&str] = &[
         "referential_constraints",
@@ -116,30 +115,36 @@ fn intercept_missing_information_schema(
                 table,
                 "Intercepting query for missing information_schema table"
             );
-            return Some(empty_query_response(query));
+            return Some(empty_query_response(inspect));
         }
     }
 
     None
 }
 
-/// Return an empty result set with the column schema extracted from the query.
-/// Power BI's RetrieveRelationshipsForTable expects a real result set with
-/// typed columns (not just CommandComplete), even if it has zero rows.
-/// We parse the query to extract column aliases from the SELECT list.
-fn empty_query_response(query: &str) -> PgWireResult<Vec<Response>> {
+/// Return an empty result set whose schema mirrors the SELECT list.
+///
+/// Power BI's `RetrieveRelationshipsForTable` expects a real result set with
+/// typed columns (not just `CommandComplete`), even if it has zero rows.
+/// Reuses the AST already parsed by the pipeline rather than re-parsing.
+fn empty_query_response(inspect: &ParsedQuery) -> PgWireResult<Vec<Response>> {
     use futures::stream;
     use pgwire::api::results::{FieldFormat, FieldInfo, QueryResponse};
 
-    // Try to extract column names from the SELECT list
-    let columns = extract_select_columns(query);
+    let mut columns = inspect.select_column_names();
+    if columns.is_empty() {
+        // Last-resort fallback when the query failed to parse — give the
+        // client one column so it can read the (zero-row) result without
+        // tripping on an empty RowDescription.
+        columns.push("column".to_owned());
+    }
 
     let schema = Arc::new(
         columns
-            .iter()
+            .into_iter()
             .map(|name| {
                 FieldInfo::new(
-                    name.clone(),
+                    name,
                     None,
                     None,
                     pgwire::api::Type::VARCHAR,
@@ -153,57 +158,6 @@ fn empty_query_response(query: &str) -> PgWireResult<Vec<Response>> {
         schema,
         stream::empty(),
     ))])
-}
-
-/// Column name PostgreSQL assigns to an unaliased SELECT item.
-///
-/// PG uses the trailing identifier for simple column refs (`t.col` → `col`),
-/// the function name for function calls, and an empty string otherwise —
-/// which then renders as `?column?`. We preserve this because clients like
-/// Power BI look up result columns by the unqualified name.
-fn unnamed_column_name(expr: &sqlparser::ast::Expr) -> String {
-    use sqlparser::ast::Expr;
-    match expr {
-        Expr::Identifier(id) => id.value.clone(),
-        Expr::CompoundIdentifier(parts) => parts
-            .last()
-            .map(|p| p.value.clone())
-            .unwrap_or_else(|| expr.to_string()),
-        Expr::Function(f) => f.name.to_string(),
-        _ => expr.to_string(),
-    }
-}
-
-/// Extract column names/aliases from a SELECT query.
-/// Falls back to generic column names if parsing fails.
-fn extract_select_columns(query: &str) -> Vec<String> {
-    use sqlparser::dialect::PostgreSqlDialect;
-    use sqlparser::parser::Parser;
-
-    let dialect = PostgreSqlDialect {};
-    let ast = match Parser::parse_sql(&dialect, query) {
-        Ok(ast) => ast,
-        Err(_) => return vec!["column".to_string()],
-    };
-
-    if let Some(sqlparser::ast::Statement::Query(q)) = ast.into_iter().next()
-        && let sqlparser::ast::SetExpr::Select(select) = *q.body
-    {
-        return select
-            .projection
-            .iter()
-            .map(|item| match item {
-                sqlparser::ast::SelectItem::UnnamedExpr(expr) => unnamed_column_name(expr),
-                sqlparser::ast::SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-                sqlparser::ast::SelectItem::Wildcard(_) => "*".to_string(),
-                sqlparser::ast::SelectItem::QualifiedWildcard(name, _) => {
-                    format!("{name}.*")
-                }
-            })
-            .collect();
-    }
-
-    vec!["column".to_string()]
 }
 
 fn intercept_transaction(upper: &str) -> Option<PgWireResult<Vec<Response>>> {
@@ -253,11 +207,23 @@ fn intercept_show(trimmed: &str) -> PgWireResult<Vec<Response>> {
     single_text_response(&param, value)
 }
 
+/// Intercept bare scalar-function probe queries that PG clients send during
+/// session setup (`SELECT version()`, `SELECT current_schema`, etc.).
+///
+/// We only intercept when the query is `SELECT <single-call> [AS alias]` with
+/// no FROM, WHERE, or other clauses; otherwise a column reference like
+/// `WHERE current_schema = 'public'` or a multi-projection query like
+/// `SELECT current_setting('a'), current_setting('b')` would be misrouted to
+/// a single-row stub response.
 fn intercept_server_functions(
     inspect: &ParsedQuery,
     catalog: &str,
     schema: &str,
 ) -> Option<PgWireResult<Vec<Response>>> {
+    if !inspect.is_bare_scalar_select() {
+        return None;
+    }
+
     if inspect.calls_function("version") {
         return Some(single_text_response(
             "version",
@@ -269,8 +235,8 @@ fn intercept_server_functions(
         return Some(single_text_response("current_database", catalog));
     }
 
-    // `current_schema` is the one PostgreSQL niladic that's idiomatically
-    // written without parens. Match the bare-identifier form as well.
+    // `current_schema` is idiomatically written without parens in PostgreSQL.
+    // Inside a bare scalar SELECT it can't be a column reference.
     if inspect.calls_function_or_keyword("current_schema") {
         return Some(single_text_response("current_schema", schema));
     }
@@ -301,10 +267,13 @@ fn intercept_server_functions(
 /// a Trino CASE WHEN that maps type names like `double` to `double precision`.
 ///
 /// Returns `None` if the query does not target `INFORMATION_SCHEMA.columns`.
-pub(crate) fn rewrite_info_schema_columns(
-    query: &str,
-    inspect: &ParsedQuery,
-) -> Option<String> {
+///
+/// Note: this rewrite uses byte-offset string splicing rather than AST
+/// transformation. The Power BI marker is a fixed driver-emitted pattern, not
+/// user input, so there is no injection risk; AST round-tripping a CASE
+/// expression of this complexity loses formatting in ways the rewrite itself
+/// is not robust to.
+pub(crate) fn rewrite_info_schema_columns(query: &str, inspect: &ParsedQuery) -> Option<String> {
     if !inspect.references_table_in_schema("information_schema", "columns") {
         return None;
     }
@@ -481,7 +450,7 @@ mod tests {
                  on i.CONSTRAINT_SCHEMA = ii.CONSTRAINT_SCHEMA \
              where i.TABLE_SCHEMA = 'sf1' and i.TABLE_NAME = 'nation'";
 
-        let cols = extract_select_columns(query);
+        let cols = ParsedQuery::new(query).select_column_names();
         assert_eq!(
             cols,
             vec![
@@ -492,16 +461,6 @@ mod tests {
             ],
             "column names must be unqualified to match PostgreSQL behavior"
         );
-    }
-
-    #[test]
-    fn unnamed_column_name_strips_qualifier() {
-        use sqlparser::ast::{Expr, Ident};
-        let compound = Expr::CompoundIdentifier(vec![Ident::new("ii"), Ident::new("COLUMN_NAME")]);
-        assert_eq!(unnamed_column_name(&compound), "COLUMN_NAME");
-
-        let simple = Expr::Identifier(Ident::new("foo"));
-        assert_eq!(unnamed_column_name(&simple), "foo");
     }
 
     #[test]

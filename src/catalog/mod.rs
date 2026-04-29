@@ -45,6 +45,13 @@ fn build_response(
 
 /// Check whether a query targets pg_catalog tables and return a pre-built
 /// static response if so.
+///
+/// Uses the unqualified `references_table`: any FROM/JOIN reference to a
+/// pg_catalog name (`pg_type`, `pg_class`, `pg_namespace`, etc.) is treated
+/// as the catalog table regardless of schema. The names are specific enough
+/// that collisions with user tables are not a real concern, and the
+/// alternative (requiring `pg_catalog.` prefix) would miss the unqualified
+/// usage that JDBC and Npgsql actually emit.
 pub fn handle_catalog_query(inspect: &ParsedQuery) -> Option<PgWireResult<Vec<Response>>> {
     // pg_attribute + pg_type join = composite field lookup.
     if inspect.references_table("pg_attribute") && inspect.references_table("pg_type") {

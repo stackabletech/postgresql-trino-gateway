@@ -34,8 +34,7 @@ pub(crate) async fn process_query(
     }
 
     // Dynamic catalog interception (pg_class, pg_attribute -- needs Trino client)
-    if let Some(result) =
-        crate::catalog::handle_dynamic_catalog_query(&inspect, trino_client).await
+    if let Some(result) = crate::catalog::handle_dynamic_catalog_query(&inspect, trino_client).await
     {
         tracing::trace!("Pipeline: dynamic catalog matched");
         return result;
