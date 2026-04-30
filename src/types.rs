@@ -425,15 +425,11 @@ mod tests {
         );
     }
 
+    /// serde_json rejects NaN as a `Value::Number`, so Trino sends it as the
+    /// string `"NaN"`. Confirm the string-passthrough path produces the
+    /// canonical PostgreSQL NaN text.
     #[test]
     fn encode_real_nan_as_pg_text() {
-        let val = serde_json::Value::Number(
-            serde_json::Number::from_f64(f64::NAN)
-                .unwrap_or_else(|| serde_json::Number::from_f64(0.0).unwrap()),
-        );
-        // serde_json rejects NaN numbers; Trino sends them as the string "NaN".
-        // Verify string passthrough still works.
-        let _ = val;
         let string_nan = serde_json::Value::String("NaN".to_owned());
         assert_eq!(encode_value(&string_nan, "real"), Some("NaN".to_owned()));
     }
@@ -466,14 +462,11 @@ mod tests {
     fn encode_bigint_overflow_does_not_silently_saturate() {
         let val = serde_json::Value::Number(serde_json::Number::from_f64(1.0e30).unwrap());
         let encoded = encode_value(&val, "bigint").expect("must encode");
+        assert_ne!(encoded, "9223372036854775807", "must not saturate to i64::MAX");
+        let parsed: f64 = encoded.parse().expect("must be valid float text");
         assert!(
-            encoded != "9223372036854775807",
-            "must not saturate to i64::MAX: got {encoded}"
-        );
-        // The float should round-trip as some recognisable form of 1e30.
-        assert!(
-            encoded.contains('e') || encoded.starts_with('1'),
-            "expected float-shaped text, got {encoded}"
+            (parsed - 1.0e30).abs() < 1.0e15,
+            "expected ~1e30, got {parsed} (text: {encoded})"
         );
     }
 
@@ -481,11 +474,9 @@ mod tests {
     fn encode_bigint_negative_overflow_does_not_saturate() {
         let val = serde_json::Value::Number(serde_json::Number::from_f64(-1.0e30).unwrap());
         let encoded = encode_value(&val, "bigint").expect("must encode");
-        assert!(
-            encoded != i64::MIN.to_string(),
-            "must not saturate to i64::MIN: got {encoded}"
-        );
-        assert!(encoded.starts_with('-'));
+        assert_ne!(encoded, i64::MIN.to_string(), "must not saturate to i64::MIN");
+        let parsed: f64 = encoded.parse().expect("must be valid float text");
+        assert!(parsed < 0.0 && parsed.abs() > 1.0e29, "expected large negative, got {parsed}");
     }
 
     #[test]
