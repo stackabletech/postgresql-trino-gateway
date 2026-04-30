@@ -6,9 +6,12 @@
 //!
 //! Loads a PEM-encoded certificate chain and private key from disk and
 //! returns a `TlsAcceptor` ready to hand to `pgwire::tokio::process_socket`.
-//! The crypto provider (`aws-lc-rs`, pulled in by pgwire's default features)
-//! must be installed once at process startup before any acceptor is built —
-//! `install_default_crypto_provider()` does that idempotently.
+//!
+//! `aws-lc-rs` is used as the rustls crypto provider, attached explicitly
+//! per `ServerConfig` rather than via the global default. This avoids the
+//! panic that `ServerConfig::builder()` raises when no process-level
+//! provider has been installed and removes the ordering coupling between
+//! `build_acceptor` and any global init step.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -18,23 +21,19 @@ use std::sync::Arc;
 use anyhow::{Context, Result, anyhow};
 use pgwire::tokio::TlsAcceptor;
 use pgwire::tokio::tokio_rustls::rustls::ServerConfig;
+use pgwire::tokio::tokio_rustls::rustls::crypto::aws_lc_rs;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
-/// Install the `aws-lc-rs` crypto provider as the rustls default. Idempotent:
-/// repeated calls (or a previous installation by another component) are
-/// silently treated as success.
-pub fn install_default_crypto_provider() {
-    use pgwire::tokio::tokio_rustls::rustls::crypto::aws_lc_rs;
-    let _ = aws_lc_rs::default_provider().install_default();
-}
-
 /// Build a `TlsAcceptor` from PEM-encoded certificate chain and private key
-/// files on disk.
+/// files on disk. Supports PKCS#8, RSA (PKCS#1), and SEC1 EC private keys.
 pub fn build_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
 
-    let cfg = ServerConfig::builder()
+    let provider = Arc::new(aws_lc_rs::default_provider());
+    let cfg = ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .context("rustls: invalid protocol-version configuration")?
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .with_context(|| {
@@ -56,10 +55,7 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         .collect::<std::io::Result<Vec<_>>>()
         .with_context(|| format!("reading TLS certificate PEM {}", path.display()))?;
     if certs.is_empty() {
-        return Err(anyhow!(
-            "no PEM certificates found in {}",
-            path.display()
-        ));
+        return Err(anyhow!("no PEM certificates found in {}", path.display()));
     }
     Ok(certs)
 }
@@ -86,6 +82,28 @@ mod tests {
             Ok(_) => panic!("expected error"),
             Err(e) => format!("{e:#}"),
         }
+    }
+
+    /// Generate a throwaway self-signed cert+key as PEM strings.
+    fn self_signed_pem() -> (String, String) {
+        let cert = rcgen::generate_simple_self_signed(vec!["gateway.test".to_owned()]).unwrap();
+        (cert.cert.pem(), cert.key_pair.serialize_pem())
+    }
+
+    #[test]
+    fn build_acceptor_succeeds_with_valid_self_signed_pair() {
+        let (cert_pem, key_pem) = self_signed_pem();
+        let mut cert_file = tempfile::NamedTempFile::new().unwrap();
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        cert_file.write_all(cert_pem.as_bytes()).unwrap();
+        key_file.write_all(key_pem.as_bytes()).unwrap();
+
+        let result = build_acceptor(cert_file.path(), key_file.path());
+        assert!(
+            result.is_ok(),
+            "expected acceptor to build cleanly with rcgen-generated PEM pair: {:?}",
+            result.as_ref().err().map(|e| format!("{e:#}"))
+        );
     }
 
     #[test]
@@ -120,19 +138,27 @@ mod tests {
         cert.write_all(b"this is not a PEM file").unwrap();
         key.write_all(b"neither is this").unwrap();
         let msg = err_msg(build_acceptor(cert.path(), key.path()));
-        // Either "no PEM certificates" (if the parser silently skips garbage)
-        // or a parse error from rustls_pemfile.
         assert!(
             msg.contains("PEM") || msg.contains("certificate"),
             "error should mention PEM/certificate parsing: {msg}"
         );
     }
 
+    /// Mismatched cert and key (cert from one self-signed pair, key from
+    /// another) must be rejected by `with_single_cert`.
     #[test]
-    fn install_provider_is_idempotent() {
-        // Repeat calls must not panic.
-        install_default_crypto_provider();
-        install_default_crypto_provider();
-        install_default_crypto_provider();
+    fn build_acceptor_rejects_mismatched_cert_and_key() {
+        let (cert_pem, _) = self_signed_pem();
+        let (_, key_pem) = self_signed_pem();
+        let mut cert_file = tempfile::NamedTempFile::new().unwrap();
+        let mut key_file = tempfile::NamedTempFile::new().unwrap();
+        cert_file.write_all(cert_pem.as_bytes()).unwrap();
+        key_file.write_all(key_pem.as_bytes()).unwrap();
+
+        let msg = err_msg(build_acceptor(cert_file.path(), key_file.path()));
+        assert!(
+            msg.contains("TLS keypair invalid"),
+            "error should mention keypair mismatch: {msg}"
+        );
     }
 }

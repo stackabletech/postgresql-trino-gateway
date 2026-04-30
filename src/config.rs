@@ -17,8 +17,9 @@ pub struct Config {
 
     /// PEM-encoded TLS certificate chain for the listening socket. When set,
     /// `--tls-key` is also required. Without these flags the gateway speaks
-    /// plaintext PG protocol — acceptable for loopback dev, never for
-    /// network deployment with `--auth`.
+    /// plaintext PG protocol; do not pair plaintext with `--auth` on a
+    /// non-loopback bind. (Operator-side discipline for now — automatic
+    /// refusal is tracked under publication-checklist item A11.)
     #[arg(long, requires = "tls_key")]
     pub tls_cert: Option<PathBuf>,
 

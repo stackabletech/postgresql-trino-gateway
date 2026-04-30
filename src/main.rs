@@ -57,13 +57,26 @@ async fn main() -> anyhow::Result<()> {
     let drain_timeout = drain_timeout_from_env();
 
     let tls_acceptor = match (&config.tls_cert, &config.tls_key) {
-        (Some(cert), Some(key)) => {
-            tls::install_default_crypto_provider();
-            Some(tls::build_acceptor(cert, key)?)
+        (Some(cert), Some(key)) => Some(tls::build_acceptor(cert, key)?),
+        (None, None) => None,
+        // Clap's `requires` enforces both-or-neither at parse time; if a
+        // caller bypassed clap (programmatic Config construction in tests)
+        // and supplied only one path, log loudly and treat as no-TLS rather
+        // than silently dropping the cert.
+        (Some(cert), None) => {
+            tracing::warn!(
+                tls_cert = %cert.display(),
+                "tls_cert set without tls_key — TLS disabled (use both flags)"
+            );
+            None
         }
-        // Clap's `requires` enforces both-or-neither; the asymmetric arms
-        // are unreachable but match exhaustively rather than panicking.
-        (None, None) | (Some(_), None) | (None, Some(_)) => None,
+        (None, Some(key)) => {
+            tracing::warn!(
+                tls_key = %key.display(),
+                "tls_key set without tls_cert — TLS disabled (use both flags)"
+            );
+            None
+        }
     };
 
     let listener = TcpListener::bind(&config.listen_addr).await?;
