@@ -70,4 +70,12 @@ pub struct Config {
     /// authentication or the network is otherwise trusted.
     #[arg(long, default_value_t = false)]
     pub allow_insecure_listener: bool,
+
+    /// Maximum number of concurrent PG client connections. Excess
+    /// connections are accepted on the TCP socket and immediately closed
+    /// with a logged warning, so an unauthenticated client cannot exhaust
+    /// the gateway's file descriptors or memory by piling on connections.
+    /// Each in-flight connection holds one slot until its task ends.
+    #[arg(long, default_value_t = 256)]
+    pub max_connections: usize,
 }

@@ -169,6 +169,7 @@ mod tests {
             trino_ssl_insecure: false,
             auth,
             allow_insecure_listener: false,
+            max_connections: 256,
         }
     }
 

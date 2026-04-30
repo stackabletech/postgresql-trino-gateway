@@ -111,6 +111,7 @@ mod tests {
                 trino_ssl_insecure: false,
                 auth: false,
                 allow_insecure_listener: false,
+                max_connections: 256,
             }),
             portals: Arc::new(Mutex::new(HashMap::new())),
         }

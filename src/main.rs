@@ -8,6 +8,7 @@ use std::time::Duration;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use postgresql_trino_gateway::config::Config;
@@ -84,6 +85,8 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    let connection_limit = Arc::new(Semaphore::new(config.max_connections));
+
     let listener = TcpListener::bind(&config.listen_addr).await?;
     tracing::info!(
         addr = %config.listen_addr,
@@ -91,6 +94,7 @@ async fn main() -> anyhow::Result<()> {
         built = env!("BUILD_TIMESTAMP"),
         drain_timeout_secs = drain_timeout.as_secs(),
         tls = tls_acceptor.is_some(),
+        max_connections = config.max_connections,
         "listening for PostgreSQL connections"
     );
 
@@ -116,9 +120,26 @@ async fn main() -> anyhow::Result<()> {
             }
             accept = listener.accept() => {
                 let (socket, peer_addr) = accept?;
+                // Take a permit before spawning the connection task. When
+                // the cap is reached we drop the socket immediately rather
+                // than queue the connection, so a flood of incoming SYNs
+                // can't pile up FD/memory pressure waiting for a slot.
+                let permit = match Arc::clone(&connection_limit).try_acquire_owned() {
+                    Ok(p) => p,
+                    Err(_) => {
+                        tracing::warn!(
+                            addr = %peer_addr,
+                            cap = config.max_connections,
+                            "rejecting connection — max_connections reached"
+                        );
+                        drop(socket);
+                        continue;
+                    }
+                };
                 let factory = Arc::clone(&factory);
                 let tls = tls_acceptor.clone();
                 tasks.spawn(async move {
+                    let _permit = permit; // released on task exit
                     let _guard = ConnectionCleanup(peer_addr);
                     if let Err(e) = pgwire::tokio::process_socket(socket, tls, factory).await {
                         tracing::error!(error = %e, "connection error");
@@ -249,6 +270,20 @@ mod tests {
             0,
             "tasks should have been aborted before completing"
         );
+    }
+
+    /// Smoke test for the connection-limiting primitive: with a 2-permit
+    /// semaphore, two `try_acquire_owned` calls succeed and the third
+    /// fails. After dropping one permit, a new acquisition succeeds.
+    /// Pins the semaphore behaviour the accept loop depends on.
+    #[tokio::test]
+    async fn semaphore_caps_concurrent_permits() {
+        let sem = Arc::new(Semaphore::new(2));
+        let p1 = Arc::clone(&sem).try_acquire_owned().unwrap();
+        let _p2 = Arc::clone(&sem).try_acquire_owned().unwrap();
+        assert!(Arc::clone(&sem).try_acquire_owned().is_err());
+        drop(p1);
+        assert!(Arc::clone(&sem).try_acquire_owned().is_ok());
     }
 
     #[test]
