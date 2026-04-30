@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use pgwire::api::results::{QueryResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use pgwire::error::{PgWireError, PgWireResult};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser;
 use trino_rust_client::Client as TrinoClient;
@@ -43,8 +43,21 @@ pub(crate) async fn process_query(
     tracing::trace!(count = pieces.len(), "Pipeline: multi-statement input");
     let mut out = Vec::with_capacity(pieces.len());
     for stmt in &pieces {
-        let mut responses = process_single_statement(stmt, trino_client, config).await?;
-        out.append(&mut responses);
+        match process_single_statement(stmt, trino_client, config).await {
+            Ok(mut responses) => out.append(&mut responses),
+            // User-visible errors (e.g. a Trino syntax error on statement N
+            // of a batch) are converted to a Response::Error so that the
+            // earlier statements' CommandComplete tags reach the client.
+            // PostgreSQL aborts the batch on first error, so we stop here
+            // and don't run remaining statements.
+            Err(PgWireError::UserError(info)) => {
+                out.push(Response::Error(info));
+                break;
+            }
+            // Connection-fatal errors (IO, missing connection state, etc.)
+            // are propagated; they tear the connection down anyway.
+            Err(other) => return Err(other),
+        }
     }
     Ok(out)
 }
@@ -172,5 +185,26 @@ mod tests {
     fn split_statements_separates_multiple_set_commands() {
         let pieces = split_statements("SET a = '1'; SET b = '2'");
         assert_eq!(pieces.len(), 2);
+    }
+
+    /// A trailing semicolon is a statement terminator, not a second
+    /// (empty) statement. Some ORMs always append one.
+    #[test]
+    fn split_statements_handles_trailing_semicolon() {
+        let pieces = split_statements("SELECT 1;");
+        assert_eq!(pieces.len(), 1);
+    }
+
+    /// Mixed DDL/DML/DQL in one batch — sqlparser handles all three and
+    /// preserves order through `to_string()`.
+    #[test]
+    fn split_statements_handles_mixed_statement_types() {
+        let pieces = split_statements(
+            "CREATE TABLE foo (id INT); INSERT INTO foo VALUES (1); SELECT * FROM foo",
+        );
+        assert_eq!(pieces.len(), 3);
+        assert!(pieces[0].to_uppercase().contains("CREATE"));
+        assert!(pieces[1].to_uppercase().contains("INSERT"));
+        assert!(pieces[2].to_uppercase().contains("SELECT"));
     }
 }
