@@ -4,15 +4,21 @@
 
 //! Startup-time security-policy validation.
 //!
-//! `--auth` enables a cleartext-password challenge on each PG connection
-//! (the only auth mechanism the gateway implements; SCRAM-SHA-256 is not a
-//! practical fit because the gateway forwards the same credentials to Trino
-//! as HTTP Basic auth, which needs the password in the clear). Cleartext on
-//! a plaintext listener is unsafe on any network. We refuse to start that
-//! configuration unless the listener is bound to a loopback address, where
-//! the operator has explicitly opted into a dev-only setup.
+//! `--auth` enables a cleartext-password challenge on each PG connection.
+//! Cleartext-over-plaintext is unsafe on any network, so the gateway refuses
+//! to start that configuration unless the listener is bound to a loopback
+//! address. SCRAM-SHA-256 is not implemented in this gateway because the
+//! current architecture forwards the cleartext password to Trino as HTTP
+//! Basic auth — a future architecture (gateway-side password store + a
+//! Trino service-account credential) could support SCRAM, but that is out
+//! of scope here.
+//!
+//! Per-connection enforcement (refusing plaintext clients when auth+TLS are
+//! configured) lives in `startup.rs` because pgwire does not refuse
+//! clients that skip the SslRequest upgrade — the gateway must check
+//! `ClientInfo::is_secure()` itself.
 
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 use anyhow::{Context, Result, bail};
 
@@ -21,14 +27,20 @@ use crate::config::Config;
 /// Result of inspecting the (auth, TLS, listen-addr) triple. Returned for
 /// logging/diagnostic use; the policy decision is enforced by `validate`'s
 /// `Result`.
+///
+/// `CleartextRequiresTls` does **not** by itself guarantee a TLS-only
+/// listener — pgwire accepts plaintext clients regardless of whether a
+/// `TlsAcceptor` is configured, because the SslRequest upgrade is opt-in
+/// per connection. The startup handler enforces TLS-only when this posture
+/// is in effect; see `startup.rs`.
 #[derive(Debug, PartialEq, Eq)]
 pub enum AuthPosture {
     /// `--auth` is off. The gateway connects to Trino with `--trino-user`
     /// and no per-client credentials.
     Disabled,
-    /// `--auth` is on and the listening socket is TLS-terminated, so
-    /// passwords cross the wire encrypted.
-    CleartextOverTls,
+    /// `--auth` is on and TLS is configured. The startup handler refuses
+    /// plaintext clients on this posture.
+    CleartextRequiresTls,
     /// `--auth` is on, no TLS, but the listener is a loopback address.
     /// Acceptable for local development only.
     CleartextLoopback,
@@ -40,12 +52,11 @@ pub enum AuthPosture {
 pub fn validate(config: &Config) -> Result<AuthPosture> {
     let posture = classify(config)?;
     match posture {
-        AuthPosture::Disabled => {
-            tracing::info!("auth disabled — connecting to Trino as --trino-user");
-        }
-        AuthPosture::CleartextOverTls => {
+        AuthPosture::Disabled => {} // default state, no log line needed
+        AuthPosture::CleartextRequiresTls => {
             tracing::info!(
-                "auth enabled — cleartext password over TLS (forwarded to Trino as HTTP Basic)"
+                "auth enabled — cleartext password over TLS \
+                 (plaintext clients will be refused; password forwarded to Trino as HTTP Basic)"
             );
         }
         AuthPosture::CleartextLoopback => {
@@ -68,22 +79,39 @@ pub fn classify(config: &Config) -> Result<AuthPosture> {
 
     let has_tls = config.tls_cert.is_some() && config.tls_key.is_some();
     if has_tls {
-        return Ok(AuthPosture::CleartextOverTls);
+        return Ok(AuthPosture::CleartextRequiresTls);
     }
 
-    let addr: SocketAddr = config
-        .listen_addr
-        .parse()
-        .with_context(|| format!("invalid --listen-addr: {}", config.listen_addr))?;
-    if addr.ip().is_loopback() {
+    if listen_addr_is_loopback(&config.listen_addr)? {
         return Ok(AuthPosture::CleartextLoopback);
     }
 
     bail!(
         "--auth on non-loopback bind ({}) requires TLS. \
-         Set --tls-cert and --tls-key, or bind to 127.0.0.1 / [::1] for dev.",
+         Set --tls-cert and --tls-key, or bind to 127.0.0.1 / [::1] / localhost for dev.",
         config.listen_addr
     )
+}
+
+/// Return true iff every address that `addr` resolves to is a loopback IP.
+///
+/// We accept hostname forms like `localhost:5432` because `TcpListener::bind`
+/// also accepts them; rejecting them on the parser path alone would block a
+/// common safe configuration. If any resolved address is non-loopback the
+/// host is considered non-loopback (conservative: a hostname pointing to
+/// both `127.0.0.1` and a public IP is treated as public).
+fn listen_addr_is_loopback(addr: &str) -> Result<bool> {
+    if let Ok(parsed) = addr.parse::<SocketAddr>() {
+        return Ok(parsed.ip().is_loopback());
+    }
+    let resolved: Vec<_> = addr
+        .to_socket_addrs()
+        .with_context(|| format!("invalid --listen-addr: {addr}"))?
+        .collect();
+    if resolved.is_empty() {
+        bail!("--listen-addr {addr} did not resolve to any address");
+    }
+    Ok(resolved.iter().all(|s| s.ip().is_loopback()))
 }
 
 #[cfg(test)]
@@ -123,15 +151,15 @@ mod tests {
     fn auth_with_tls_passes_on_any_address() {
         assert_eq!(
             classify(&cfg(true, "0.0.0.0:5432", true)).unwrap(),
-            AuthPosture::CleartextOverTls
+            AuthPosture::CleartextRequiresTls
         );
         assert_eq!(
             classify(&cfg(true, "127.0.0.1:5432", true)).unwrap(),
-            AuthPosture::CleartextOverTls
+            AuthPosture::CleartextRequiresTls
         );
         assert_eq!(
             classify(&cfg(true, "[::]:5432", true)).unwrap(),
-            AuthPosture::CleartextOverTls
+            AuthPosture::CleartextRequiresTls
         );
     }
 
@@ -143,6 +171,26 @@ mod tests {
         );
         assert_eq!(
             classify(&cfg(true, "[::1]:5432", false)).unwrap(),
+            AuthPosture::CleartextLoopback
+        );
+    }
+
+    /// `IpAddr::is_loopback` accepts the entire 127.0.0.0/8 range (RFC 5735),
+    /// not just 127.0.0.1. Document and pin that behaviour.
+    #[test]
+    fn auth_without_tls_on_non_canonical_loopback_passes() {
+        assert_eq!(
+            classify(&cfg(true, "127.0.0.2:5432", false)).unwrap(),
+            AuthPosture::CleartextLoopback
+        );
+    }
+
+    /// `localhost` resolves to a loopback IP on every reasonable system.
+    /// Accept it rather than rejecting a common safe configuration.
+    #[test]
+    fn auth_without_tls_on_localhost_hostname_passes() {
+        assert_eq!(
+            classify(&cfg(true, "localhost:5432", false)).unwrap(),
             AuthPosture::CleartextLoopback
         );
     }
@@ -162,9 +210,15 @@ mod tests {
     }
 
     #[test]
-    fn invalid_listen_addr_with_auth_no_tls_surfaces_parse_error() {
-        let err = classify(&cfg(true, "not-an-address", false)).unwrap_err();
-        assert!(format!("{err:#}").contains("invalid --listen-addr"));
+    fn unparseable_listen_addr_with_auth_no_tls_surfaces_resolve_error() {
+        // Use a name that DNS will not resolve. The error must mention the
+        // input verbatim so the operator can fix it.
+        let err = classify(&cfg(true, "not.a.real.host.invalid:5432", false)).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("invalid --listen-addr") || msg.contains("not.a.real.host.invalid"),
+            "should surface the bad input: {msg}"
+        );
     }
 
     /// Asymmetric tls_cert without tls_key is treated as no-TLS by the
@@ -176,5 +230,16 @@ mod tests {
         c.tls_cert = Some(PathBuf::from("/tmp/cert"));
         c.tls_key = None;
         assert!(classify(&c).is_err());
+    }
+
+    /// Disabled posture skips listen-addr validation by design — without
+    /// auth, there are no credentials to protect. `TcpListener::bind` will
+    /// surface its own error if the address is unusable.
+    #[test]
+    fn auth_disabled_does_not_validate_listen_addr() {
+        assert_eq!(
+            classify(&cfg(false, "garbage", false)).unwrap(),
+            AuthPosture::Disabled
+        );
     }
 }

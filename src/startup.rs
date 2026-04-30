@@ -13,7 +13,7 @@ use pgwire::api::auth::{
     save_startup_parameters_to_metadata,
 };
 use pgwire::api::{ClientInfo, PgWireConnectionState};
-use pgwire::error::{PgWireError, PgWireResult};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::startup::{Authentication, SecretKey};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use trino_rust_client::auth::Auth;
@@ -92,6 +92,22 @@ impl StartupHandler for GatewayStartupHandler {
                 );
                 protocol_negotiation(client, startup).await?;
                 save_startup_parameters_to_metadata(client, startup);
+
+                // pgwire's negotiate_tls upgrades only if the client first
+                // sent an SslRequest; clients that skip the upgrade reach
+                // here over plaintext. When auth+TLS are configured, refuse
+                // such clients before issuing a cleartext-password challenge.
+                if self.config.auth && self.tls_required() && !client.is_secure() {
+                    tracing::warn!(
+                        addr = %client.socket_addr(),
+                        "rejecting plaintext client — --auth with TLS configured requires SslRequest"
+                    );
+                    return Err(PgWireError::UserError(Box::new(ErrorInfo::new(
+                        "FATAL".to_owned(),
+                        "28000".to_owned(), // invalid_authorization_specification
+                        "TLS is required for password authentication on this server".to_owned(),
+                    ))));
+                }
 
                 if self.config.auth {
                     // Request password from PG client
@@ -184,6 +200,13 @@ impl StartupHandler for GatewayStartupHandler {
 }
 
 impl GatewayStartupHandler {
+    /// True iff the operator configured TLS termination (`--tls-cert` and
+    /// `--tls-key` both present). When auth is also on, plaintext clients
+    /// are refused; see `policy::AuthPosture::CleartextRequiresTls`.
+    fn tls_required(&self) -> bool {
+        self.config.tls_cert.is_some() && self.config.tls_key.is_some()
+    }
+
     /// Build a Trino client, optionally with Basic auth credentials from the PG client.
     fn build_trino_client(
         &self,
