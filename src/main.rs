@@ -85,6 +85,12 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    if config.max_connections == 0 {
+        anyhow::bail!(
+            "--max-connections 0 would refuse every connection. \
+             Use a positive value (default 256)."
+        );
+    }
     let connection_limit = Arc::new(Semaphore::new(config.max_connections));
 
     let listener = TcpListener::bind(&config.listen_addr).await?;
@@ -155,23 +161,30 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Resolve the drain timeout from the environment, falling back to the
-/// compile-time default. Invalid or missing values are logged and replaced.
+/// compile-time default.
 fn drain_timeout_from_env() -> Duration {
-    match std::env::var(SHUTDOWN_DRAIN_TIMEOUT_ENV) {
-        Ok(v) => match v.parse::<u64>() {
-            Ok(secs) => Duration::from_secs(secs),
-            Err(e) => {
-                tracing::warn!(
-                    var = SHUTDOWN_DRAIN_TIMEOUT_ENV,
-                    value = %v,
-                    error = %e,
-                    fallback_secs = DEFAULT_SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
-                    "ignoring unparseable shutdown drain timeout, using default"
-                );
-                DEFAULT_SHUTDOWN_DRAIN_TIMEOUT
-            }
-        },
-        Err(_) => DEFAULT_SHUTDOWN_DRAIN_TIMEOUT,
+    parse_drain_timeout(std::env::var(SHUTDOWN_DRAIN_TIMEOUT_ENV).ok())
+}
+
+/// Pure parsing helper for `drain_timeout_from_env`. Extracted so tests can
+/// exercise the unparseable-fallback path without mutating the process-wide
+/// environment.
+fn parse_drain_timeout(raw: Option<String>) -> Duration {
+    let Some(v) = raw else {
+        return DEFAULT_SHUTDOWN_DRAIN_TIMEOUT;
+    };
+    match v.parse::<u64>() {
+        Ok(secs) => Duration::from_secs(secs),
+        Err(e) => {
+            tracing::warn!(
+                var = SHUTDOWN_DRAIN_TIMEOUT_ENV,
+                value = %v,
+                error = %e,
+                fallback_secs = DEFAULT_SHUTDOWN_DRAIN_TIMEOUT.as_secs(),
+                "ignoring unparseable shutdown drain timeout, using default"
+            );
+            DEFAULT_SHUTDOWN_DRAIN_TIMEOUT
+        }
     }
 }
 
@@ -287,21 +300,19 @@ mod tests {
     }
 
     #[test]
-    fn drain_timeout_falls_back_on_unparseable_env() {
-        // Use a unique env var so this test doesn't race with itself.
-        // SAFETY: tests in this module that touch GATEWAY_SHUTDOWN_DRAIN_TIMEOUT_SECS
-        // would need #[serial], but we only read the public function, which
-        // takes the var name as a constant — exercise it directly.
-        let prev = std::env::var(SHUTDOWN_DRAIN_TIMEOUT_ENV).ok();
-        // SAFETY: single-threaded test; no concurrent env access here.
-        unsafe { std::env::set_var(SHUTDOWN_DRAIN_TIMEOUT_ENV, "not-a-number") };
-        assert_eq!(drain_timeout_from_env(), DEFAULT_SHUTDOWN_DRAIN_TIMEOUT);
-        // restore
-        unsafe {
-            match prev {
-                Some(v) => std::env::set_var(SHUTDOWN_DRAIN_TIMEOUT_ENV, v),
-                None => std::env::remove_var(SHUTDOWN_DRAIN_TIMEOUT_ENV),
-            }
-        }
+    fn drain_timeout_parser_handles_inputs() {
+        assert_eq!(parse_drain_timeout(None), DEFAULT_SHUTDOWN_DRAIN_TIMEOUT);
+        assert_eq!(
+            parse_drain_timeout(Some("not-a-number".to_owned())),
+            DEFAULT_SHUTDOWN_DRAIN_TIMEOUT
+        );
+        assert_eq!(
+            parse_drain_timeout(Some("0".to_owned())),
+            Duration::from_secs(0)
+        );
+        assert_eq!(
+            parse_drain_timeout(Some("60".to_owned())),
+            Duration::from_secs(60)
+        );
     }
 }
