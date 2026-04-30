@@ -392,8 +392,8 @@ mod tests {
 
     #[test]
     fn encode_float_number() {
-        let val = serde_json::json!(3.14);
-        assert_eq!(encode_value(&val, "double"), Some("3.14".to_owned()));
+        let val = serde_json::json!(3.5);
+        assert_eq!(encode_value(&val, "double"), Some("3.5".to_owned()));
     }
 
     /// Regression: Trino can serialize a BIGINT whole number as JSON `42.0`;
@@ -442,8 +442,8 @@ mod tests {
 
     #[test]
     fn encode_real_normal_value() {
-        let val = serde_json::json!(3.14);
-        assert_eq!(encode_value(&val, "real"), Some("3.14".to_owned()));
+        let val = serde_json::json!(3.5);
+        assert_eq!(encode_value(&val, "real"), Some("3.5".to_owned()));
     }
 
     #[test]

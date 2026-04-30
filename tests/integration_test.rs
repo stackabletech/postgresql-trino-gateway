@@ -1,6 +1,12 @@
 // Copyright 2026 Stackable GmbH
 // Licensed under the Open Software License version 3.0 (OSL-3.0).
 // See LICENSE file in the project root for full license text.
+
+// This whole crate is test code; clippy doesn't recognise the async helper
+// functions as `#[test]`-annotated, so the test-allowance config in
+// clippy.toml doesn't apply. Re-allow the specific lints here.
+#![allow(clippy::panic, clippy::unwrap_used)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -29,16 +35,11 @@ async fn start_gateway(config: Config) -> SocketAddr {
         Arc::new(GatewayExtendedQueryHandler),
     ));
     tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((socket, _)) => {
-                    let factory = factory.clone();
-                    tokio::spawn(async move {
-                        let _ = pgwire::tokio::process_socket(socket, None, factory).await;
-                    });
-                }
-                Err(_) => break,
-            }
+        while let Ok((socket, _)) = listener.accept().await {
+            let factory = factory.clone();
+            tokio::spawn(async move {
+                let _ = pgwire::tokio::process_socket(socket, None, factory).await;
+            });
         }
     });
     addr
@@ -944,7 +945,7 @@ async fn test_pg_class_from_trino() {
             .await
             .unwrap(),
     );
-    assert!(rows.len() > 0, "pg_class should return tables from Trino");
+    assert!(!rows.is_empty(), "pg_class should return tables from Trino");
 
     // pg_class returns: oid(0), relname(1), relnamespace(2), relkind(3)
     let table_names: Vec<&str> = rows.iter().map(|r| r.get(1).unwrap()).collect();
@@ -974,7 +975,7 @@ async fn test_information_schema_passthrough() {
             .unwrap(),
     );
     assert!(
-        rows.len() > 0,
+        !rows.is_empty(),
         "information_schema.tables should return results"
     );
 }

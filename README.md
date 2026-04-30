@@ -10,9 +10,9 @@ Copyright 2026 Stackable GmbH. Licensed under OSL-3.0.
 
 ### Prerequisites
 
-- [Rust](https://rustup.rs/) (1.85+ recommended)
+- [Rust](https://rustup.rs/) 1.93+ (pinned by `rust-toolchain.toml`; rustup installs the toolchain on first build).
 - A running Trino instance
-- For static builds: `musl-tools` (see `build-static.sh`)
+- For static builds: `musl-tools` (see `scripts/build-static.sh`)
 
 ### Build
 
@@ -160,24 +160,28 @@ TRINO_WRITE_CATALOG=memory TRINO_WRITE_SCHEMA=default \
 ## Project Structure
 
 ```
-gateway/
-  src/
-    main.rs              # CLI, TCP listener
-    config.rs            # Configuration (clap)
-    startup.rs           # PG connection startup, auth, Trino client creation
-    handler.rs           # PgWireServerHandlers factory
-    query_simple.rs      # Simple query protocol
-    query_extended.rs    # Extended query protocol (Parse/Bind/Execute)
-    query_pipeline.rs    # Shared query processing pipeline
-    intercept.rs         # SET/SHOW/transaction interception
-    catalog/             # pg_catalog emulation
-    rewrite/             # SQL rewriting (casts, ILIKE, functions)
-    types.rs             # Trino-to-PG type mapping
-    trino_stream.rs      # Streaming bridge (Trino polling -> PG DataRow)
-    error_mapping.rs     # Trino error -> PG SQLSTATE mapping
-  tests/
-    integration_test.rs  # Data-driven integration tests
-  vendor/
-    pgwire/              # PostgreSQL wire protocol library
-    trino-rust-client/   # Trino REST API client
+src/
+  main.rs              # CLI, TCP listener, accept loop, graceful shutdown
+  config.rs            # Configuration (clap)
+  policy.rs            # Startup-time auth/TLS/listener-policy validation
+  startup.rs           # PG connection startup, auth, Trino client creation
+  tls.rs               # TLS termination for the listening socket
+  handler.rs           # PgWireServerHandlers factory
+  query_simple.rs      # Simple query protocol
+  query_extended.rs    # Extended query protocol (Parse/Bind/Execute)
+  query_pipeline.rs    # Shared query processing pipeline
+  query_inspection.rs  # AST-based dispatch (table/function references)
+  intercept.rs         # SET/SHOW/transaction interception
+  cancel.rs            # PG CancelRequest -> Trino DELETE
+  session.rs           # Per-connection state, cancel registry, portal cache
+  catalog/             # pg_catalog emulation
+  rewrite/             # SQL rewriting (casts, ILIKE, functions)
+  types.rs             # Trino-to-PG type mapping
+  trino_stream.rs      # Streaming bridge (Trino polling -> PG DataRow)
+  error_mapping.rs     # Trino error -> PG SQLSTATE mapping
+tests/
+  integration_test.rs  # Data-driven integration tests against a real Trino
 ```
+
+Dependencies are managed through `Cargo.toml`; the `pgwire` and
+`trino-rust-client` crates are pulled from crates.io.

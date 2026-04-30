@@ -9,7 +9,7 @@
 #   # On RHEL:  sudo dnf install musl-gcc (from EPEL)
 set -euo pipefail
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 TARGET="x86_64-unknown-linux-musl"
 

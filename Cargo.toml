@@ -2,6 +2,7 @@
 name = "postgresql-trino-gateway"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.93"
 authors = ["Stackable GmbH"]
 description = "A PostgreSQL wire protocol gateway for Trino, enabling Power BI DirectQuery"
 license = "OSL-3.0"

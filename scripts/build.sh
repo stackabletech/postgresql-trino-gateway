@@ -3,7 +3,7 @@
 # Produces a dynamically-linked binary at target/release/postgresql-trino-gateway.
 set -euo pipefail
 
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/.."
 
 echo "Building postgresql-trino-gateway (release)..."
 cargo build --release

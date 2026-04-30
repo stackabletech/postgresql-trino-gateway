@@ -1,4 +1,17 @@
 /target
+
+# Local working docs and tracker files (not part of the published repo).
 TODO.md
 POWERBI_DEBUG.md
 PUBLICATION_CHECKLIST.md
+
+# Reference checkouts of upstream projects kept on disk for grep/spelunking
+# during gateway development (pgwire, pgjdbc, npgsql, the Trino client, ...).
+/context/
+
+# Local Claude Code state.
+/.claude/
+
+# Operator-local Trino config and ad-hoc debug captures.
+trino.yaml
+/debuglogs/

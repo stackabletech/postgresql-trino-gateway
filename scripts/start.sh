@@ -3,6 +3,8 @@
 # Configure via environment variables or edit the defaults below.
 set -euo pipefail
 
+cd "$(dirname "$0")/.."
+
 LISTEN_ADDR="${LISTEN_ADDR:-0.0.0.0:15432}"
 TRINO_HOST="${TRINO_HOST:?Set TRINO_HOST environment variable}"
 TRINO_PORT="${TRINO_PORT:-8443}"
@@ -22,7 +24,7 @@ if [ ! -f "$BINARY" ]; then
     BINARY="./target/debug/postgresql-trino-gateway"
 fi
 if [ ! -f "$BINARY" ]; then
-    echo "Error: Binary not found. Run ./build.sh first." >&2
+    echo "Error: Binary not found. Run ./scripts/build.sh first." >&2
     exit 1
 fi
 
