@@ -16,6 +16,7 @@ use pgwire::api::{ClientInfo, PgWireConnectionState};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::startup::{Authentication, SecretKey};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+use rand::Rng;
 use trino_rust_client::auth::Auth;
 
 use crate::config::Config;
@@ -24,6 +25,16 @@ use crate::session::{self, ConnectionState};
 /// Monotonically-increasing connection counter used as the BackendKeyData PID.
 /// Starts at 1 so it is never zero (PID 0 means "not received" in Npgsql).
 static CONNECTION_PID: AtomicI32 = AtomicI32::new(1);
+
+/// Allocate a fresh `(pid, secret_key)` pair for a new connection. The pid
+/// is a sequential counter for human-readable logging; the secret_key is a
+/// CSPRNG-generated 32-bit value so an attacker can't guess the cancel
+/// authorisation token for somebody else's connection.
+fn new_pid_and_secret_key() -> (i32, SecretKey) {
+    let pid = CONNECTION_PID.fetch_add(1, Ordering::Relaxed);
+    let secret = rand::thread_rng().r#gen::<i32>();
+    (pid, SecretKey::I32(secret))
+}
 
 /// Server parameter provider that returns PostgreSQL-compatible parameters.
 #[derive(Debug)]
@@ -119,22 +130,26 @@ impl StartupHandler for GatewayStartupHandler {
                         .await?;
                 } else {
                     // No auth — create Trino client immediately
-                    client.set_pid_and_secret_key(
-                        CONNECTION_PID.fetch_add(1, Ordering::Relaxed),
-                        SecretKey::I32(0),
+                    let trino_client = Arc::new(self.build_trino_client(None, None)?);
+                    let (pid, secret_key) = new_pid_and_secret_key();
+                    client.set_pid_and_secret_key(pid, secret_key.clone());
+                    let active_query_id = session::register_cancel(
+                        pid,
+                        secret_key.clone(),
+                        Arc::clone(&trino_client),
                     );
-                    let conn_id =
-                        format!("{}_{}", client.socket_addr(), client.pid_and_secret_key().0);
+                    let conn_id = format!("{}_{}", client.socket_addr(), pid);
                     client
                         .metadata_mut()
                         .insert(session::connection_id_key().to_owned(), conn_id.clone());
-                    let trino_client = self.build_trino_client(None, None)?;
                     session::register_connection(
                         conn_id,
                         ConnectionState {
-                            trino_client: Arc::new(trino_client),
+                            trino_client,
                             config: self.config.clone(),
                             portals: Default::default(),
+                            active_query_id,
+                            cancel_key: (pid, secret_key),
                         },
                     );
                     finish_authentication(client, &GatewayParameterProvider).await?;
@@ -169,20 +184,26 @@ impl StartupHandler for GatewayStartupHandler {
                     return Err(PgWireError::InvalidPassword(user));
                 }
 
-                client.set_pid_and_secret_key(
-                    CONNECTION_PID.fetch_add(1, Ordering::Relaxed),
-                    SecretKey::I32(0),
+                let trino_client = Arc::new(trino_client);
+                let (pid, secret_key) = new_pid_and_secret_key();
+                client.set_pid_and_secret_key(pid, secret_key.clone());
+                let active_query_id = session::register_cancel(
+                    pid,
+                    secret_key.clone(),
+                    Arc::clone(&trino_client),
                 );
-                let conn_id = format!("{}_{}", client.socket_addr(), client.pid_and_secret_key().0);
+                let conn_id = format!("{}_{}", client.socket_addr(), pid);
                 client
                     .metadata_mut()
                     .insert(session::connection_id_key().to_owned(), conn_id.clone());
                 session::register_connection(
                     conn_id,
                     ConnectionState {
-                        trino_client: Arc::new(trino_client),
+                        trino_client,
                         config: self.config.clone(),
                         portals: Default::default(),
+                        active_query_id,
+                        cancel_key: (pid, secret_key),
                     },
                 );
                 finish_authentication(client, &GatewayParameterProvider).await?;

@@ -7,9 +7,55 @@ use std::sync::{Arc, LazyLock, Mutex};
 
 use dashmap::DashMap;
 use pgwire::api::results::Response;
+use pgwire::messages::startup::SecretKey;
 use trino_rust_client::Client as TrinoClient;
 
 use crate::config::Config;
+
+/// Trino query id of the connection's currently-running query, shared
+/// between the streaming bridge (writer) and the cancel handler (reader).
+/// `None` when the connection is idle or hasn't yet sent a query to Trino.
+pub type ActiveQueryId = Arc<Mutex<Option<String>>>;
+
+/// Routing entry for a PG `CancelRequest`. Created at connection startup
+/// and removed when the originating `ConnectionState` is dropped.
+pub struct CancelEntry {
+    pub trino_client: Arc<TrinoClient>,
+    pub active_query_id: ActiveQueryId,
+}
+
+/// Map keyed by `(pid, secret_key)` (the pair pgwire sends in
+/// `BackendKeyData` and matches in a subsequent `CancelRequest`). Lives
+/// for the duration of the connection's session.
+static CANCEL_REGISTRY: LazyLock<DashMap<(i32, SecretKey), CancelEntry>> =
+    LazyLock::new(DashMap::new);
+
+pub fn register_cancel(
+    pid: i32,
+    secret_key: SecretKey,
+    trino_client: Arc<TrinoClient>,
+) -> ActiveQueryId {
+    let active_query_id = Arc::new(Mutex::new(None));
+    CANCEL_REGISTRY.insert(
+        (pid, secret_key),
+        CancelEntry {
+            trino_client,
+            active_query_id: Arc::clone(&active_query_id),
+        },
+    );
+    active_query_id
+}
+
+pub fn lookup_cancel(
+    pid: i32,
+    secret_key: &SecretKey,
+) -> Option<dashmap::mapref::one::Ref<'_, (i32, SecretKey), CancelEntry>> {
+    CANCEL_REGISTRY.get(&(pid, secret_key.clone()))
+}
+
+pub fn unregister_cancel(pid: i32, secret_key: &SecretKey) {
+    CANCEL_REGISTRY.remove(&(pid, secret_key.clone()));
+}
 
 /// A cached pipeline response keyed by the SQL text it was produced for.
 ///
@@ -52,6 +98,20 @@ pub struct ConnectionState {
     /// of twice. Orphaned entries (Describe with no Execute) are freed when
     /// the connection's state is removed.
     pub portals: PortalCache,
+    /// Slot the streaming bridge writes when Trino returns the initial
+    /// response for a query. Read by the `CancelHandler` to issue a
+    /// `DELETE /v1/query/{id}` against Trino on a PG `CancelRequest`.
+    pub active_query_id: ActiveQueryId,
+    /// `(pid, secret_key)` registered with `CANCEL_REGISTRY` at startup.
+    /// `Drop` uses this to clean the registry entry when the connection
+    /// state is removed (panic, normal close, drain abort).
+    pub cancel_key: (i32, SecretKey),
+}
+
+impl Drop for ConnectionState {
+    fn drop(&mut self) {
+        unregister_cancel(self.cancel_key.0, &self.cancel_key.1);
+    }
 }
 
 static CONNECTIONS: LazyLock<DashMap<String, ConnectionState>> = LazyLock::new(DashMap::new);
@@ -94,10 +154,22 @@ mod tests {
     use std::sync::Arc;
     use trino_rust_client::ClientBuilder;
 
+    /// Counter so each call gets a unique cancel_key — the dummy state's
+    /// Drop unregisters from the global registry, so reusing keys across
+    /// tests would race.
+    fn next_test_pid() -> i32 {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        static N: AtomicI32 = AtomicI32::new(900_000);
+        N.fetch_add(1, Ordering::Relaxed)
+    }
+
     fn dummy_state() -> ConnectionState {
-        let client = ClientBuilder::new("u", "h").build().unwrap();
+        let client = Arc::new(ClientBuilder::new("u", "h").build().unwrap());
+        let pid = next_test_pid();
+        let secret = SecretKey::I32(pid);
+        let active_query_id = register_cancel(pid, secret.clone(), Arc::clone(&client));
         ConnectionState {
-            trino_client: Arc::new(client),
+            trino_client: client,
             config: Arc::new(Config {
                 listen_addr: "127.0.0.1:5432".to_owned(),
                 tls_cert: None,
@@ -115,6 +187,8 @@ mod tests {
                 max_connections: 256,
             }),
             portals: Arc::new(Mutex::new(HashMap::new())),
+            active_query_id,
+            cancel_key: (pid, secret),
         }
     }
 

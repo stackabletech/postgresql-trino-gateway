@@ -39,9 +39,10 @@ impl SimpleQueryHandler for GatewayQueryHandler {
             .ok_or_else(|| PgWireError::ApiError("Connection state not found".into()))?;
         let trino_client = Arc::clone(&conn_state.trino_client);
         let config = Arc::clone(&conn_state.config);
+        let active_query_id = Arc::clone(&conn_state.active_query_id);
         drop(conn_state);
 
-        let result = process_query(query, &trino_client, &config).await;
+        let result = process_query(query, &trino_client, &config, Some(&active_query_id)).await;
         match &result {
             Ok(responses) => tracing::trace!(
                 conn_id = %conn_id,

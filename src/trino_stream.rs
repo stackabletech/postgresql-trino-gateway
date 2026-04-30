@@ -12,6 +12,7 @@ use serde_json::Value;
 use trino_rust_client::models::{Column, QueryResultData};
 use trino_rust_client::{Client, Row};
 
+use crate::session::ActiveQueryId;
 use crate::types::{encode_value, trino_type_to_pg};
 
 /// Column metadata from Trino, used for encoding.
@@ -74,10 +75,13 @@ fn extract_direct_rows(data: Option<QueryResultData<Row>>) -> Vec<Vec<Value>> {
 /// Submit a query to Trino and return (schema, row_stream).
 ///
 /// The stream polls nextUri until done, yielding DataRow items suitable for
-/// pgwire's QueryResponse.
+/// pgwire's QueryResponse. If `active_query_id` is `Some`, the Trino query
+/// id from the initial response is recorded there so the cancel handler can
+/// issue `client.cancel(id)` against this connection's running query.
 pub async fn execute_trino_query(
     client: &Arc<Client>,
     sql: String,
+    active_query_id: Option<&ActiveQueryId>,
 ) -> Result<
     (
         Arc<Vec<FieldInfo>>,
@@ -91,6 +95,18 @@ pub async fn execute_trino_query(
         let info = crate::error_mapping::trino_error_to_pg(&e.to_string());
         PgWireError::UserError(Box::new(info))
     })?;
+
+    // Record the Trino query id so a concurrent CancelRequest can find it.
+    // We do this before checking for errors so that a query that fails
+    // immediately can still be cancelled while it's being torn down — the
+    // id is non-empty and trino_client.cancel() on a finished query is a
+    // harmless no-op.
+    if let Some(slot) = active_query_id {
+        match slot.lock() {
+            Ok(mut g) => *g = Some(result.id.clone()),
+            Err(p) => *p.into_inner() = Some(result.id.clone()),
+        }
+    }
 
     // 2. Check for immediate error
     if let Some(error) = &result.error {

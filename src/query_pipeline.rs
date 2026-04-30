@@ -11,6 +11,7 @@ use trino_rust_client::Client as TrinoClient;
 
 use crate::config::Config;
 use crate::query_inspection::ParsedQuery;
+use crate::session::ActiveQueryId;
 use crate::trino_stream::execute_trino_query;
 
 /// Core query processing pipeline.
@@ -32,18 +33,19 @@ pub(crate) async fn process_query(
     query: &str,
     trino_client: &Arc<TrinoClient>,
     config: &Arc<Config>,
+    active_query_id: Option<&ActiveQueryId>,
 ) -> PgWireResult<Vec<Response>> {
     tracing::trace!(query, "Pipeline: enter");
 
     let pieces = split_statements(query);
     if pieces.len() <= 1 {
-        return process_single_statement(query, trino_client, config).await;
+        return process_single_statement(query, trino_client, config, active_query_id).await;
     }
 
     tracing::trace!(count = pieces.len(), "Pipeline: multi-statement input");
     let mut out = Vec::with_capacity(pieces.len());
     for stmt in &pieces {
-        match process_single_statement(stmt, trino_client, config).await {
+        match process_single_statement(stmt, trino_client, config, active_query_id).await {
             Ok(mut responses) => out.append(&mut responses),
             // User-visible errors (e.g. a Trino syntax error on statement N
             // of a batch) are converted to a Response::Error so that the
@@ -79,6 +81,7 @@ async fn process_single_statement(
     query: &str,
     trino_client: &Arc<TrinoClient>,
     config: &Arc<Config>,
+    active_query_id: Option<&ActiveQueryId>,
 ) -> PgWireResult<Vec<Response>> {
     let inspect = ParsedQuery::new(query);
 
@@ -116,7 +119,8 @@ async fn process_single_statement(
     }
     tracing::debug!(original = query, rewritten = %rewritten, "Rewritten query");
 
-    let (schema, row_stream) = execute_trino_query(trino_client, rewritten).await?;
+    let (schema, row_stream) =
+        execute_trino_query(trino_client, rewritten, active_query_id).await?;
 
     if schema.is_empty() {
         tracing::trace!("Pipeline: Trino returned no schema — treating as DDL/DML");

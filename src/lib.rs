@@ -1,6 +1,7 @@
 // Copyright 2026 Stackable GmbH
 // Licensed under the Open Software License version 3.0 (OSL-3.0).
 // See LICENSE file in the project root for full license text.
+pub mod cancel;
 pub mod catalog;
 pub mod config;
 pub mod error_mapping;

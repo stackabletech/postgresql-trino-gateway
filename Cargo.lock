@@ -1623,6 +1623,7 @@ dependencies = [
  "dashmap",
  "futures",
  "pgwire",
+ "rand 0.8.5",
  "rcgen",
  "rustls-pemfile",
  "rustls-pki-types",

@@ -86,9 +86,11 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
 
         let trino_client = Arc::clone(&conn_state.trino_client);
         let config = Arc::clone(&conn_state.config);
+        let active_query_id = Arc::clone(&conn_state.active_query_id);
         drop(conn_state);
 
-        let responses = process_query(query, &trino_client, &config).await?;
+        let responses =
+            process_query(query, &trino_client, &config, Some(&active_query_id)).await?;
         let response = responses
             .into_iter()
             .next()
@@ -164,12 +166,14 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
             .ok_or_else(|| PgWireError::ApiError("Connection state not found".into()))?;
         let trino_client = Arc::clone(&conn_state.trino_client);
         let config = Arc::clone(&conn_state.config);
-        // Clone the Arc so we can stash the result after the .await below;
+        // Clone the Arcs so we can use them after the .await below;
         // conn_state is a DashMap ref-guard that can't be held across awaits.
         let portals = Arc::clone(&conn_state.portals);
+        let active_query_id = Arc::clone(&conn_state.active_query_id);
         drop(conn_state);
 
-        let responses = process_query(query, &trino_client, &config).await?;
+        let responses =
+            process_query(query, &trino_client, &config, Some(&active_query_id)).await?;
         let response = responses
             .into_iter()
             .next()
