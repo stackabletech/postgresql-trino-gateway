@@ -1046,3 +1046,102 @@ async fn test_auth_passthrough_to_trino() {
     let rows = extract_rows(client.simple_query("SELECT 1").await.unwrap());
     assert_eq!(rows.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Extended query protocol (Parse / Bind / Describe / Execute)
+//
+// `simple_query` uses the simple-query protocol; `query` and `prepare`
+// drive the extended-query handler in `query_extended.rs`. Until these
+// were added, the extended path had zero direct test coverage.
+// ---------------------------------------------------------------------------
+
+/// Prepare-and-execute drives Parse/Bind/Describe/Execute end-to-end. The
+/// portal-cache path in query_extended is exercised here: do_describe_portal
+/// runs the query and stashes the response, do_query takes the stash.
+#[tokio::test]
+async fn test_extended_prepared_select() {
+    let config = match trino_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping: TRINO_HOST not set");
+            return;
+        }
+    };
+    let addr = start_gateway(config).await;
+    let client = connect(addr).await;
+
+    let stmt = client.prepare("SELECT 1::int4 AS one").await.unwrap();
+    let rows = client.query(&stmt, &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let one: i32 = rows[0].get(0);
+    assert_eq!(one, 1);
+}
+
+/// A second Execute on the same prepared statement: the portal cache from
+/// the first Describe is consumed, so the second Execute re-runs through
+/// the pipeline. Checks the cache-miss fallback path.
+#[tokio::test]
+async fn test_extended_re_execute() {
+    let config = match trino_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping: TRINO_HOST not set");
+            return;
+        }
+    };
+    let addr = start_gateway(config).await;
+    let client = connect(addr).await;
+
+    let stmt = client.prepare("SELECT 42::int4").await.unwrap();
+    for _ in 0..3 {
+        let rows = client.query(&stmt, &[]).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        let v: i32 = rows[0].get(0);
+        assert_eq!(v, 42);
+    }
+}
+
+/// Two distinct prepared statements on one connection — both must work
+/// without colliding on the unnamed portal or interfering with each other's
+/// active_query_id slot.
+#[tokio::test]
+async fn test_extended_two_prepared_statements() {
+    let config = match trino_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping: TRINO_HOST not set");
+            return;
+        }
+    };
+    let addr = start_gateway(config).await;
+    let client = connect(addr).await;
+
+    let stmt_a = client.prepare("SELECT 1::int4").await.unwrap();
+    let stmt_b = client.prepare("SELECT 2::int4").await.unwrap();
+
+    let rows_a = client.query(&stmt_a, &[]).await.unwrap();
+    let rows_b = client.query(&stmt_b, &[]).await.unwrap();
+
+    assert_eq!(rows_a[0].get::<_, i32>(0), 1);
+    assert_eq!(rows_b[0].get::<_, i32>(0), 2);
+}
+
+/// Catalog-emulation queries reach Trino through the extended path too —
+/// Npgsql and pgjdbc drive type loading via prepared statements. Confirm
+/// the static intercept still answers correctly via that path.
+#[tokio::test]
+async fn test_extended_catalog_intercept() {
+    let config = match trino_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping: TRINO_HOST not set");
+            return;
+        }
+    };
+    let addr = start_gateway(config).await;
+    let client = connect(addr).await;
+
+    let stmt = client.prepare("SELECT oid, typname FROM pg_type LIMIT 5").await.unwrap();
+    let rows = client.query(&stmt, &[]).await.unwrap();
+    assert!(!rows.is_empty(), "pg_type intercept should return rows");
+}
