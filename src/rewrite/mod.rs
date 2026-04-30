@@ -15,7 +15,7 @@ use sqlparser::parser::Parser;
 ///
 /// This function relies on sqlparser's round-trip (parse -> transform -> to_string)
 /// being semantics-preserving. On parse failure, the original SQL is returned
-/// unchanged -- no partial rewrites. The rewriter only transforms AST nodes,
+/// unchanged — no partial rewrites. The rewriter only transforms AST nodes,
 /// never raw strings, which prevents rewriting-induced SQL injection.
 ///
 /// Applies the following transformations:
@@ -26,6 +26,10 @@ use sqlparser::parser::Parser;
 ///
 /// If parsing fails (e.g. for `SET`, `SHOW`, `DISCARD` commands), the original
 /// SQL is returned unchanged.
+///
+/// Multi-statement input is rejected — the caller (`query_pipeline`) splits
+/// statements before reaching the rewriter, so a multi-statement string here
+/// is a bug. We pass it through unchanged and Trino will surface the error.
 pub fn rewrite_sql(sql: &str) -> String {
     let dialect = PostgreSqlDialect {};
     let mut statements = match Parser::new(&dialect).try_with_sql(sql) {
@@ -36,25 +40,29 @@ pub fn rewrite_sql(sql: &str) -> String {
         Err(_) => return sql.to_string(),
     };
 
-    if statements.is_empty() {
-        return sql.to_string();
-    }
+    let stmt = match statements.len() {
+        0 => return sql.to_string(),
+        1 => &mut statements[0],
+        _ => {
+            // Should not happen — see the doc-comment. Logging instead of
+            // joining-with-semicolons because the join was the original
+            // multi-statement bug we are deliberately avoiding here.
+            tracing::warn!(
+                count = statements.len(),
+                "rewrite_sql received multi-statement input; passing through unchanged"
+            );
+            return sql.to_string();
+        }
+    };
 
     let mut cast_rewriter = casts::CastRewriter;
     let mut ilike_rewriter = predicates::ILikeRewriter;
     let mut fn_renamer = functions::FunctionRenamer;
+    let _ = stmt.visit(&mut cast_rewriter);
+    let _ = stmt.visit(&mut ilike_rewriter);
+    let _ = stmt.visit(&mut fn_renamer);
 
-    for stmt in &mut statements {
-        let _ = stmt.visit(&mut cast_rewriter);
-        let _ = stmt.visit(&mut ilike_rewriter);
-        let _ = stmt.visit(&mut fn_renamer);
-    }
-
-    statements
-        .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>()
-        .join("; ")
+    stmt.to_string()
 }
 
 #[cfg(test)]
