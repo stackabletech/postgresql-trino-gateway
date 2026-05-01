@@ -1,0 +1,39 @@
+---
+name: pre-commit
+
+on:
+  pull_request:
+  merge_group:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN_VERSION: "1.93.0"
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
+        uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f53e8b695cdcc8de1b
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN_VERSION }}
+          components: rustfmt, clippy
+
+      - name: Setup Rust Cache
+        uses: Swatinem/rust-cache@98c8021b550208e191a6a3145459bfc9fb29c4c0 # v2.8.0
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@97a5807a604e12de3a13b52d868ebecaeeea757c # v2.75.4
+        with:
+          tool: cargo-deny
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - uses: pre-commit/action@2c7b3805fd2a0fd8c1884dcaebf91fc102a13ecd # v3.0.1
