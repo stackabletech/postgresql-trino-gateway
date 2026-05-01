@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 use std::sync::Arc;
 
 use pgwire::api::results::{QueryResponse, Response, Tag};
@@ -28,7 +27,7 @@ use crate::trino_stream::execute_trino_query;
 /// inside a string literal (`SET foo = 'a;b'`) does not cause a split. When
 /// the parser cannot tokenise the SQL (`DISCARD ALL`, dialect-only DDL,
 /// etc.), fall back to processing the original string as one statement —
-/// matching the rewriter's existing parse-failure behaviour.
+/// matching `rewrite::rewrite_sql`'s passthrough-on-parse-failure behaviour.
 ///
 /// Cancellation in multi-statement batches: the same `active_query_id`
 /// slot is passed to each statement. As statement N submits to Trino, it
@@ -93,12 +92,18 @@ async fn process_single_statement(
     config: &Arc<Config>,
     active_query_id: Option<&ActiveQueryId>,
 ) -> PgWireResult<Vec<Response>> {
-    let inspect = ParsedQuery::new(query);
+    // The query is parsed up to three times: once here (for routing
+    // checks), once by the multi-statement splitter in the public
+    // `process_query`, and once by the rewriter inside `rewrite_sql`.
+    // Threading a single parse through all three would shave a few µs on
+    // the Power BI INFORMATION_SCHEMA query but isn't measurable on
+    // small inputs; deferred until profiling shows it matters.
+    let parsed_query = ParsedQuery::new(query);
 
     // Static catalog interception (pg_type, pg_enum, pg_range, pg_namespace, etc.)
-    if let Some(result) = crate::intercept::intercept_query(
+    if let Some(result) = crate::intercept::try_intercept(
         query,
-        &inspect,
+        &parsed_query,
         &config.trino_catalog,
         &config.trino_schema,
     ) {
@@ -107,14 +112,15 @@ async fn process_single_statement(
     }
 
     // Dynamic catalog interception (pg_class, pg_attribute -- needs Trino client)
-    if let Some(result) = crate::catalog::handle_dynamic_catalog_query(&inspect, trino_client).await
+    if let Some(result) =
+        crate::catalog::handle_dynamic_catalog_query(&parsed_query, trino_client).await
     {
         tracing::trace!("Pipeline: dynamic catalog matched");
         return result;
     }
 
     // Rewrite INFORMATION_SCHEMA.columns DATA_TYPE to PostgreSQL-style type names.
-    let rewritten_columns = crate::info_schema::rewrite_info_schema_columns(query, &inspect);
+    let rewritten_columns = crate::info_schema::rewrite_info_schema_columns(query, &parsed_query);
     if rewritten_columns.is_some() {
         tracing::trace!("Pipeline: rewrote INFORMATION_SCHEMA.columns");
     }

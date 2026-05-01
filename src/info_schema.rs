@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 
 //! Handling for `INFORMATION_SCHEMA` queries that Trino doesn't model the
 //! same way Postgres does. Two responsibilities:
@@ -36,15 +35,15 @@ const MISSING_TABLES: &[&str] = &[
 ];
 
 pub(crate) fn intercept_missing_information_schema(
-    inspect: &ParsedQuery,
+    query: &ParsedQuery,
 ) -> Option<PgWireResult<Vec<Response>>> {
     for table in MISSING_TABLES {
-        if inspect.references_table_in_schema("information_schema", table) {
+        if query.references_table_in_schema("information_schema", table) {
             tracing::debug!(
                 table,
                 "Intercepting query for missing information_schema table"
             );
-            return Some(empty_query_response(inspect));
+            return Some(empty_query_response(query));
         }
     }
     None
@@ -53,8 +52,8 @@ pub(crate) fn intercept_missing_information_schema(
 /// Empty result set whose schema mirrors the SELECT list of the input
 /// query. Power BI's `RetrieveRelationshipsForTable` expects a typed result
 /// (not just `CommandComplete`), even with zero rows.
-fn empty_query_response(inspect: &ParsedQuery) -> PgWireResult<Vec<Response>> {
-    let mut columns = inspect.select_column_names();
+fn empty_query_response(query: &ParsedQuery) -> PgWireResult<Vec<Response>> {
+    let mut columns = query.select_column_names();
     if columns.is_empty() {
         // Last-resort fallback when the query failed to parse: give the
         // client one column so it can read the (zero-row) result without
@@ -96,9 +95,9 @@ fn empty_query_response(inspect: &ParsedQuery) -> PgWireResult<Vec<Response>> {
 /// is sufficient and preserves byte alignment.
 pub(crate) fn rewrite_info_schema_columns(
     query: &str,
-    inspect: &ParsedQuery,
+    parsed_query: &ParsedQuery,
 ) -> Option<String> {
-    if !inspect.references_table_in_schema("information_schema", "columns") {
+    if !parsed_query.references_table_in_schema("information_schema", "columns") {
         return None;
     }
     let upper = query.to_ascii_uppercase();
@@ -146,8 +145,8 @@ mod tests {
             where TABLE_SCHEMA = 'sf1' and TABLE_NAME = 'orders' \
             order by TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION";
 
-        let inspect = ParsedQuery::new(query);
-        let rewritten = rewrite_info_schema_columns(query, &inspect)
+        let parsed_query = ParsedQuery::new(query);
+        let rewritten = rewrite_info_schema_columns(query, &parsed_query)
             .expect("should rewrite Power BI INFORMATION_SCHEMA.columns query");
 
         assert!(
@@ -177,9 +176,9 @@ mod tests {
             "SELECT * FROM pg_type",
             "SELECT 1",
         ] {
-            let inspect = ParsedQuery::new(q);
+            let parsed_query = ParsedQuery::new(q);
             assert!(
-                rewrite_info_schema_columns(q, &inspect).is_none(),
+                rewrite_info_schema_columns(q, &parsed_query).is_none(),
                 "should not rewrite: {q}"
             );
         }
@@ -191,8 +190,8 @@ mod tests {
     #[test]
     fn skips_other_schemas() {
         let q = "SELECT * FROM mycustom.columns";
-        let inspect = ParsedQuery::new(q);
-        assert!(rewrite_info_schema_columns(q, &inspect).is_none());
+        let parsed_query = ParsedQuery::new(q);
+        assert!(rewrite_info_schema_columns(q, &parsed_query).is_none());
     }
 
     /// Regression: non-ASCII content in a string literal before the Power
@@ -206,8 +205,8 @@ mod tests {
             case when (data_type like '%unsigned%') then DATA_TYPE || ' unsigned' else DATA_TYPE end as DATA_TYPE \
             from INFORMATION_SCHEMA.columns where TABLE_NAME = 'orders'";
 
-        let inspect = ParsedQuery::new(query);
-        let rewritten = rewrite_info_schema_columns(query, &inspect)
+        let parsed_query = ParsedQuery::new(query);
+        let rewritten = rewrite_info_schema_columns(query, &parsed_query)
             .expect("rewrite must trigger on INFORMATION_SCHEMA.columns");
 
         assert!(

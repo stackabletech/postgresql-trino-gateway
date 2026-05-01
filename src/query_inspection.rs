@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 
 //! AST-based inspection of incoming SQL for routing decisions.
 //!
@@ -251,6 +250,16 @@ fn unnamed_select_name(expr: &Expr) -> String {
     }
 }
 
+/// True if the trailing identifier of a multi-part SQL name equals `want`,
+/// case-insensitively.
+///
+/// `ObjectNamePart` is sqlparser's representation of one segment of a
+/// dotted SQL identifier: `catalog.schema.table` parses to three
+/// `ObjectNamePart`s (`catalog`, `schema`, `table`); a bare `pg_type`
+/// parses to one. We compare against the *last* segment because that is
+/// always the table or function name; the leading segments are catalog or
+/// schema qualifiers, which `references_table_in_schema` handles
+/// separately.
 fn last_ident_eq(parts: &[ObjectNamePart], want: &str) -> bool {
     parts
         .last()

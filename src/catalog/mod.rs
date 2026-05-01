@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 mod pg_attribute;
 pub(crate) mod pg_class;
 mod pg_type;
@@ -21,6 +20,18 @@ use crate::query_inspection::ParsedQuery;
 /// text wire format.
 pub(crate) fn text_field(name: &str, ty: Type) -> FieldInfo {
     FieldInfo::new(name.to_owned(), None, None, ty, FieldFormat::Text)
+}
+
+/// Read a string column from a Trino row decoded as `serde_json::Value`s,
+/// falling back to `default` when the index is out of range or the value
+/// isn't a string. Used by pg_class / pg_attribute responders to keep the
+/// row-decoding boilerplate to one line per column.
+pub(crate) fn json_str<'a>(
+    values: &'a [serde_json::Value],
+    idx: usize,
+    default: &'a str,
+) -> &'a str {
+    values.get(idx).and_then(|v| v.as_str()).unwrap_or(default)
 }
 
 /// Build a QueryResponse from a schema and rows of string values.
@@ -60,26 +71,26 @@ fn build_response(
 /// that collisions with user tables are not a real concern, and the
 /// alternative (requiring `pg_catalog.` prefix) would miss the unqualified
 /// usage that JDBC and Npgsql actually emit.
-pub fn handle_catalog_query(inspect: &ParsedQuery) -> Option<PgWireResult<Vec<Response>>> {
+pub fn handle_catalog_query(query: &ParsedQuery) -> Option<PgWireResult<Vec<Response>>> {
     // pg_attribute + pg_type join = composite field lookup.
-    if inspect.references_table("pg_attribute") && inspect.references_table("pg_type") {
+    if query.references_table("pg_attribute") && query.references_table("pg_type") {
         return Some(stubs::empty_composite_fields());
     }
 
     // pg_enum must come before pg_type because the enum query joins pg_type.
-    if inspect.references_table("pg_enum") {
+    if query.references_table("pg_enum") {
         return Some(stubs::empty_enum_labels());
     }
 
-    if inspect.references_table("pg_type") {
+    if query.references_table("pg_type") {
         return Some(pg_type::respond_type_loading());
     }
 
-    if inspect.references_table("pg_range") {
+    if query.references_table("pg_range") {
         return Some(stubs::empty_pg_range());
     }
 
-    if inspect.references_table("pg_namespace") {
+    if query.references_table("pg_namespace") {
         return Some(stubs::respond_pg_namespace());
     }
 
@@ -90,20 +101,25 @@ pub fn handle_catalog_query(inspect: &ParsedQuery) -> Option<PgWireResult<Vec<Re
 /// Check whether a query targets pg_class or pg_attribute and, if so, query
 /// Trino's information_schema to build a real response.
 pub async fn handle_dynamic_catalog_query(
-    inspect: &ParsedQuery,
+    query: &ParsedQuery,
     client: &Arc<Client>,
 ) -> Option<PgWireResult<Vec<Response>>> {
-    // pg_attribute + pg_type join is the composite field lookup; static.
-    if inspect.references_table("pg_attribute") && inspect.references_table("pg_type") {
+    // PostgreSQL composite types (`CREATE TYPE foo AS (a int, b text)`) are
+    // looked up by joining `pg_attribute` to `pg_type` to recover the
+    // composite's field list. Npgsql probes for these on every connection
+    // even when the schema has no composites; we serve a static empty
+    // response from `handle_catalog_query` and short-circuit here so the
+    // dynamic path doesn't try to resolve a non-existent table list.
+    if query.references_table("pg_attribute") && query.references_table("pg_type") {
         return None;
     }
 
-    if inspect.references_table("pg_class") {
+    if query.references_table("pg_class") {
         tracing::debug!("Dynamic catalog: pg_class");
         return Some(pg_class::respond_pg_class(client).await);
     }
 
-    if inspect.references_table("pg_attribute") {
+    if query.references_table("pg_attribute") {
         tracing::debug!("Dynamic catalog: pg_attribute");
         return Some(pg_attribute::respond_pg_attribute(client).await);
     }
@@ -116,8 +132,8 @@ mod tests {
     use super::*;
 
     fn dispatch(sql: &str) -> Option<PgWireResult<Vec<Response>>> {
-        let inspect = ParsedQuery::new(sql);
-        handle_catalog_query(&inspect)
+        let query = ParsedQuery::new(sql);
+        handle_catalog_query(&query)
     }
 
     #[test]

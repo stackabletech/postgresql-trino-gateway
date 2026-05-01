@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 use std::sync::Arc;
 
 use futures::stream;
@@ -25,11 +24,22 @@ fn single_text_response(column_name: &str, value: &str) -> PgWireResult<Vec<Resp
     ))])
 }
 
-/// Check whether a query should be intercepted locally instead of forwarded to
-/// Trino. Returns `Some(response)` for intercepted queries, `None` otherwise.
-pub fn intercept_query(
+/// If the query can be answered locally instead of forwarded to Trino,
+/// build the response and return it. Returns `None` for queries that
+/// should pass through to Trino.
+///
+/// `SET`, `DISCARD`, and `DEALLOCATE` are matched by raw keyword prefix
+/// because sqlparser's `PostgreSqlDialect` either doesn't model them or
+/// does so partially. `BEGIN`/`COMMIT`/`ROLLBACK` *are* modelled as
+/// `Statement::StartTransaction`/`Commit`/`Rollback` and could be detected
+/// via `ParsedQuery`, but the prefix path is simpler and consistent with
+/// the SET/DISCARD case. The AST-based checks below (`references_table`,
+/// `calls_function`) handle the cases where prefix matching would
+/// misroute a user query that *contains* a catalog name as a literal or
+/// column reference.
+pub fn try_intercept(
     query: &str,
-    inspect: &ParsedQuery,
+    parsed_query: &ParsedQuery,
     catalog: &str,
     schema: &str,
 ) -> Option<PgWireResult<Vec<Response>>> {
@@ -38,8 +48,10 @@ pub fn intercept_query(
         return None;
     }
 
-    // Remove trailing semicolons for keyword-prefix matching. The AST-based
-    // checks against `inspect` use the original query.
+    // Strip a trailing `;` so the keyword-prefix matches below (e.g.
+    // `upper.starts_with("SET ")`) work whether or not the client sent
+    // a terminator. The AST checks (which use `parsed_query`) operate on
+    // the original unmodified string and don't need this.
     let trimmed = trimmed.trim_end_matches(';').trim();
     let upper = trimmed.to_uppercase();
 
@@ -49,7 +61,8 @@ pub fn intercept_query(
     }
 
     // Transaction commands. Trino has no client-managed transactions, so
-    // BEGIN/COMMIT/ROLLBACK are no-op acknowledgements.
+    // BEGIN/COMMIT/ROLLBACK are silently acknowledged as no-ops. README
+    // documents this for users who expect real transactional semantics.
     let txn_tag = if upper == "BEGIN"
         || upper.starts_with("BEGIN ")
         || upper.starts_with("START TRANSACTION")
@@ -77,19 +90,19 @@ pub fn intercept_query(
         return Some(intercept_show(trimmed));
     }
 
-    if let Some(resp) = intercept_server_functions(inspect, catalog, schema) {
+    if let Some(resp) = intercept_server_functions(parsed_query, catalog, schema) {
         tracing::trace!(query = trimmed, "Intercept: server function");
         return Some(resp);
     }
 
-    if let Some(resp) = crate::catalog::handle_catalog_query(inspect) {
+    if let Some(resp) = crate::catalog::handle_catalog_query(parsed_query) {
         tracing::trace!(query = trimmed, "Intercept: pg_catalog");
         return Some(resp);
     }
 
     // Power BI confirms its client encoding via INFORMATION_SCHEMA.character_sets;
     // real PostgreSQL returns one row, "UTF8".
-    if inspect.references_table_in_schema("information_schema", "character_sets") {
+    if parsed_query.references_table_in_schema("information_schema", "character_sets") {
         tracing::trace!(query = trimmed, "Intercept: CHARACTER_SETS");
         return Some(single_text_response("character_set_name", "UTF8"));
     }
@@ -97,7 +110,7 @@ pub fn intercept_query(
     // information_schema tables Trino doesn't expose — return an empty
     // result with the right column shape so Power BI's relationship
     // discovery proceeds.
-    if let Some(resp) = crate::info_schema::intercept_missing_information_schema(inspect) {
+    if let Some(resp) = crate::info_schema::intercept_missing_information_schema(parsed_query) {
         return Some(resp);
     }
 
@@ -124,36 +137,37 @@ fn intercept_show(trimmed: &str) -> PgWireResult<Vec<Response>> {
 /// `SELECT current_setting('a'), current_setting('b')` would be misrouted to
 /// a single-row stub response.
 fn intercept_server_functions(
-    inspect: &ParsedQuery,
+    query: &ParsedQuery,
     catalog: &str,
     schema: &str,
 ) -> Option<PgWireResult<Vec<Response>>> {
-    if !inspect.is_bare_scalar_select() {
+    if !query.is_bare_scalar_select() {
         return None;
     }
 
-    if inspect.calls_function("version") {
+    // TOOD: We're impersonating PostgreSQL 16 - are there any protocol changes for 17 or 18 and why did you pick 16? Do we rely on pgwire or sqlparser for version support?
+    if query.calls_function("version") {
         return Some(single_text_response(
             "version",
             "PostgreSQL 16.6 on x86_64-pc-linux-gnu, compiled by gcc 12.2.0, 64-bit",
         ));
     }
 
-    if inspect.calls_function("current_database") {
+    if query.calls_function("current_database") {
         return Some(single_text_response("current_database", catalog));
     }
 
     // `current_schema` is idiomatically written without parens in PostgreSQL.
     // Inside a bare scalar SELECT it can't be a column reference.
-    if inspect.calls_function_or_keyword("current_schema") {
+    if query.calls_function_or_keyword("current_schema") {
         return Some(single_text_response("current_schema", schema));
     }
 
-    if inspect.calls_function("pg_is_in_recovery") {
+    if query.calls_function("pg_is_in_recovery") {
         return Some(single_text_response("pg_is_in_recovery", "false"));
     }
 
-    if let Some(setting) = inspect.function_string_arg("current_setting") {
+    if let Some(setting) = query.function_string_arg("current_setting") {
         let value = match setting.as_str() {
             "server_version_num" => Some("160006"),
             "server_version" => Some("16.6"),
@@ -172,17 +186,17 @@ mod tests {
     use super::*;
 
     fn assert_intercepted(query: &str) {
-        let inspect = ParsedQuery::new(query);
+        let parsed_query = ParsedQuery::new(query);
         assert!(
-            intercept_query(query, &inspect, "test_catalog", "test_schema").is_some(),
+            try_intercept(query, &parsed_query, "test_catalog", "test_schema").is_some(),
             "expected query to be intercepted: {query}"
         );
     }
 
     fn assert_not_intercepted(query: &str) {
-        let inspect = ParsedQuery::new(query);
+        let parsed_query = ParsedQuery::new(query);
         assert!(
-            intercept_query(query, &inspect, "test_catalog", "test_schema").is_none(),
+            try_intercept(query, &parsed_query, "test_catalog", "test_schema").is_none(),
             "expected query to NOT be intercepted: {query}"
         );
     }
@@ -231,8 +245,8 @@ mod tests {
         ];
 
         for &(query, expected) in cases {
-            let inspect = ParsedQuery::new(query);
-            let result = intercept_query(query, &inspect, "test_catalog", "test_schema")
+            let parsed_query = ParsedQuery::new(query);
+            let result = try_intercept(query, &parsed_query, "test_catalog", "test_schema")
                 .unwrap_or_else(|| panic!("SHOW not intercepted: {query}"));
             assert!(result.is_ok(), "SHOW returned error for: {query}");
 
