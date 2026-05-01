@@ -1,0 +1,176 @@
+---
+# Default values for postgresql-trino-gateway.
+
+replicaCount: 1
+
+image:
+  registry: oci.stackable.tech
+  repository: sdp/postgresql-trino-gateway
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 782252253
+  runAsGroup: 574654813
+  fsGroup: 782252253
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: true
+  runAsNonRoot: true
+  runAsUser: 782252253
+
+service:
+  type: ClusterIP
+  port: 5432
+  targetPort: 5432
+  annotations: {}
+
+resources:
+  limits:
+    cpu: "1"
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+# Probes use TCP socket checks. The gateway speaks PG wire protocol on
+# its listening port and exposes no HTTP health endpoint, so an HTTP
+# probe is not applicable.
+livenessProbe:
+  tcpSocket:
+    port: postgres
+  initialDelaySeconds: 10
+  periodSeconds: 30
+  timeoutSeconds: 5
+  failureThreshold: 3
+
+readinessProbe:
+  tcpSocket:
+    port: postgres
+  initialDelaySeconds: 3
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+startupProbe:
+  tcpSocket:
+    port: postgres
+  initialDelaySeconds: 2
+  periodSeconds: 3
+  failureThreshold: 20
+
+# K8s waits this long after sending SIGTERM before SIGKILL. The gateway
+# uses GATEWAY_SHUTDOWN_DRAIN_TIMEOUT_SECS internally; that value should
+# be a few seconds smaller than this so the gateway has time to abort
+# stuck connections before the kubelet terminates the process.
+terminationGracePeriodSeconds: 30
+shutdownDrainTimeoutSecs: 25
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# Number of concurrent PG client connections accepted before new
+# connections are immediately closed. A flood of incoming SYNs cannot
+# pile up FDs or memory waiting for a slot.
+maxConnections: 256
+
+# RUST_LOG value passed to the container.
+# Examples:
+#   postgresql_trino_gateway=info       # default
+#   postgresql_trino_gateway=debug      # query-level
+#   postgresql_trino_gateway=trace      # protocol-level
+logLevel: postgresql_trino_gateway=info
+
+# ----------------------------------------------------------------------
+# Trino backend
+# ----------------------------------------------------------------------
+trino:
+  # Trino coordinator hostname. Required.
+  host: ""
+  port: 8443
+  catalog: memory
+  schema: default
+
+  # Default Trino user when client auth is disabled (see auth.enabled).
+  user: trino
+
+  # Connect to Trino via HTTPS.
+  ssl: true
+
+  # Skip Trino TLS certificate-chain and hostname verification. Useful
+  # with self-signed certs on a trusted network. Has no effect without
+  # `ssl: true`.
+  tlsNoVerify: false
+
+  # Allow forwarding the PG client password to Trino over plain HTTP
+  # (Basic auth). Required when auth.enabled=true and ssl=false. Has no
+  # effect when ssl=true. Use only with a loopback or trusted Trino.
+  allowPlaintextAuth: false
+
+# ----------------------------------------------------------------------
+# Listener authentication
+# ----------------------------------------------------------------------
+auth:
+  # When true, the gateway issues a CleartextPassword challenge to PG
+  # clients and forwards (user, password) to Trino as HTTP Basic auth.
+  # When false, every client connects to Trino as `trino.user` with no
+  # per-client credentials (suitable when Trino itself authenticates,
+  # or in trusted environments).
+  enabled: false
+
+  # Acknowledge that the gateway should accept unauthenticated PG
+  # connections on a non-loopback bind. The pod's listening interface
+  # is non-loopback by definition, so this MUST be true when
+  # auth.enabled=false. NetworkPolicy is the recommended access control
+  # in that posture.
+  allowInsecureListener: true
+
+# ----------------------------------------------------------------------
+# Listener TLS
+# ----------------------------------------------------------------------
+# When auth.enabled=true on a non-loopback bind (i.e. always, in K8s),
+# the gateway requires TLS termination on the listener. Pick exactly one
+# of:
+#   - tls.secretClass     (Stackable secret-operator provisions a cert)
+#   - tls.existingSecret  (an existing kubernetes.io/tls Secret)
+# Leave both empty to disable listener TLS — the gateway will refuse to
+# start with auth.enabled=true unless the bind is loopback (it is not).
+tls:
+  # Stackable SecretClass name. The Secret Operator provisions tls.crt
+  # and tls.key into /stackable/listener-tls.
+  secretClass: ""
+
+  # Name of an existing Secret of type kubernetes.io/tls (with tls.crt
+  # and tls.key keys) to mount as the listener cert/key.
+  existingSecret: ""
+
+# ----------------------------------------------------------------------
+# Trino TLS CA (optional)
+# ----------------------------------------------------------------------
+# trino-rust-client uses the system trust store for verification when
+# trino.tlsNoVerify=false. For Trino instances served by a private CA,
+# either set trino.tlsNoVerify=true (skips verification entirely) or
+# rebuild the image with the CA injected into /etc/pki/ca-trust/source
+# /anchors. First-class CA injection is not configured here.

@@ -1,0 +1,138 @@
+{{- if not .Values.trino.host -}}
+{{- fail "trino.host is required — set the Trino coordinator hostname in values.yaml" -}}
+{{- end -}}
+{{- if and .Values.tls.secretClass .Values.tls.existingSecret -}}
+{{- fail "Set at most one of tls.secretClass or tls.existingSecret" -}}
+{{- end -}}
+{{- if and .Values.auth.enabled (not (include "postgresql-trino-gateway.tlsEnabled" .)) -}}
+{{- fail "auth.enabled=true requires listener TLS — set tls.secretClass or tls.existingSecret" -}}
+{{- end -}}
+{{- if and (not .Values.auth.enabled) (not .Values.auth.allowInsecureListener) -}}
+{{- fail "auth.enabled=false on Kubernetes requires auth.allowInsecureListener=true — the pod listens on a non-loopback interface" -}}
+{{- end -}}
+{{- if and .Values.auth.enabled (not .Values.trino.ssl) (not .Values.trino.allowPlaintextAuth) -}}
+{{- fail "auth.enabled=true with trino.ssl=false requires trino.allowPlaintextAuth=true (the gateway forwards the password to Trino over plain HTTP)" -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "postgresql-trino-gateway.fullname" . }}
+  labels:
+    {{- include "postgresql-trino-gateway.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "postgresql-trino-gateway.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "postgresql-trino-gateway.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "postgresql-trino-gateway.serviceAccountName" . }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: gateway
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: {{ include "postgresql-trino-gateway.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - --listen-addr=0.0.0.0:{{ .Values.service.targetPort }}
+            - --trino-host={{ .Values.trino.host }}
+            - --trino-port={{ .Values.trino.port }}
+            - --trino-catalog={{ .Values.trino.catalog }}
+            - --trino-schema={{ .Values.trino.schema }}
+            - --trino-user={{ .Values.trino.user }}
+            - --max-connections={{ .Values.maxConnections }}
+            {{- if .Values.trino.ssl }}
+            - --trino-ssl
+            {{- end }}
+            {{- if .Values.trino.tlsNoVerify }}
+            - --trino-tls-no-verify
+            {{- end }}
+            {{- if .Values.trino.allowPlaintextAuth }}
+            - --trino-allow-plaintext-auth
+            {{- end }}
+            {{- if .Values.auth.enabled }}
+            - --auth
+            {{- end }}
+            {{- if and (not .Values.auth.enabled) .Values.auth.allowInsecureListener }}
+            - --allow-insecure-listener
+            {{- end }}
+            {{- if eq (include "postgresql-trino-gateway.tlsEnabled" .) "true" }}
+            - --tls-cert=/stackable/listener-tls/tls.crt
+            - --tls-key=/stackable/listener-tls/tls.key
+            {{- end }}
+          env:
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+            - name: GATEWAY_SHUTDOWN_DRAIN_TIMEOUT_SECS
+              value: {{ .Values.shutdownDrainTimeoutSecs | quote }}
+          ports:
+            - name: postgres
+              containerPort: {{ .Values.service.targetPort }}
+              protocol: TCP
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          {{- with .Values.startupProbe }}
+          startupProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          {{- if eq (include "postgresql-trino-gateway.tlsEnabled" .) "true" }}
+          volumeMounts:
+            - name: listener-tls
+              mountPath: /stackable/listener-tls
+              readOnly: true
+          {{- end }}
+      {{- if eq (include "postgresql-trino-gateway.tlsEnabled" .) "true" }}
+      volumes:
+        - name: listener-tls
+          {{- if .Values.tls.secretClass }}
+          ephemeral:
+            volumeClaimTemplate:
+              metadata:
+                annotations:
+                  secrets.stackable.tech/class: {{ .Values.tls.secretClass | quote }}
+                  secrets.stackable.tech/scope: pod
+              spec:
+                storageClassName: secrets.stackable.tech
+                accessModes:
+                  - ReadWriteOnce
+                resources:
+                  requests:
+                    storage: "1"
+          {{- else }}
+          secret:
+            secretName: {{ .Values.tls.existingSecret | quote }}
+          {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
