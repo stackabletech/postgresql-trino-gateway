@@ -1,10 +1,23 @@
 // SPDX-FileCopyrightText: 2026 Stackable GmbH
 // SPDX-License-Identifier: OSL-3.0
+
+//! Per-connection state and the cross-connection cancel registry.
+//!
+//! Per-connection state (`ConnectionState`) lives in pgwire's
+//! `SessionExtensions` map (added in pgwire 0.39). The map is a typed
+//! `Arc`-store hung off `ClientInfo`, so each handler can pull the same
+//! `Arc<ConnectionState>` for the connection it's serving without a
+//! global keyed lookup.
+//!
+//! The cancel registry stays global because a `CancelRequest` arrives on
+//! a separate TCP connection that has its own `SessionExtensions` —
+//! routing it back to the originating connection's running Trino query
+//! requires a process-wide map keyed by the `(pid, secret_key)` pair
+//! pgwire sends in `BackendKeyData`.
+
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex};
 
-use dashmap::DashMap;
 use pgwire::api::results::Response;
 use pgwire::messages::startup::SecretKey;
 use trino_rust_client::Client as TrinoClient;
@@ -24,24 +37,14 @@ pub struct CancelEntry {
 }
 
 /// Map keyed by `(pid, secret_key)` (the pair pgwire sends in
-/// `BackendKeyData` and matches in a subsequent `CancelRequest`). Lives
-/// for the duration of the connection's session.
+/// `BackendKeyData` and matches in a subsequent `CancelRequest`).
 ///
-/// Cleanup runs on connection-task exit via two independent paths:
-///
-/// 1. `ConnectionCleanup` (a `Drop` guard in `main.rs` per spawned task)
-///    calls `remove_connections_for_addr`, which drops the
-///    `ConnectionState` for every `{addr}_{pid}` key matching this
-///    socket address.
-/// 2. `ConnectionState::Drop` (impl below) calls `unregister_cancel`,
-///    which removes the matching `CANCEL_REGISTRY` entry.
-///
-/// Both paths run on normal close, error return from `process_socket`,
-/// task panic, and `JoinSet::abort_all` (used by the shutdown drain).
-/// Idle TCP timeouts surface as a read error from the PG socket, which
-/// returns from `process_socket` and triggers (1).
-static CANCEL_REGISTRY: LazyLock<DashMap<(i32, SecretKey), CancelEntry>> =
-    LazyLock::new(DashMap::new);
+/// Cleanup runs via `Drop for ConnectionState` (below) — when the last
+/// `Arc<ConnectionState>` is dropped (which happens automatically when
+/// pgwire tears down the connection's `SessionExtensions`), the
+/// `unregister_cancel` call removes our entry.
+static CANCEL_REGISTRY: LazyLock<Mutex<HashMap<(i32, SecretKey), CancelEntry>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub fn register_cancel(
     pid: i32,
@@ -49,7 +52,8 @@ pub fn register_cancel(
     trino_client: Arc<TrinoClient>,
 ) -> ActiveQueryId {
     let active_query_id = Arc::new(Mutex::new(None));
-    CANCEL_REGISTRY.insert(
+    let mut registry = CANCEL_REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
+    registry.insert(
         (pid, secret_key),
         CancelEntry {
             trino_client,
@@ -59,15 +63,25 @@ pub fn register_cancel(
     active_query_id
 }
 
+/// Look up a cancel entry by `(pid, secret_key)` and clone out the bits
+/// the cancel handler needs. Returns `None` when no matching entry exists.
+///
+/// We clone rather than return a reference so the caller can `await`
+/// across the resulting Trino-cancel call without holding the registry's
+/// mutex.
 pub fn lookup_cancel(
     pid: i32,
     secret_key: &SecretKey,
-) -> Option<dashmap::mapref::one::Ref<'_, (i32, SecretKey), CancelEntry>> {
-    CANCEL_REGISTRY.get(&(pid, secret_key.clone()))
+) -> Option<(Arc<TrinoClient>, ActiveQueryId)> {
+    let registry = CANCEL_REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
+    registry
+        .get(&(pid, secret_key.clone()))
+        .map(|e| (Arc::clone(&e.trino_client), Arc::clone(&e.active_query_id)))
 }
 
 pub fn unregister_cancel(pid: i32, secret_key: &SecretKey) {
-    CANCEL_REGISTRY.remove(&(pid, secret_key.clone()));
+    let mut registry = CANCEL_REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
+    registry.remove(&(pid, secret_key.clone()));
 }
 
 /// A cached pipeline response keyed by the SQL text it was produced for.
@@ -98,11 +112,11 @@ pub type PortalCache = Arc<Mutex<HashMap<String, CachedPortalResponse>>>;
 /// pushed into unbounded memory or Trino-side query growth by one connection.
 pub const MAX_CACHED_PORTALS: usize = 64;
 
-/// Per-connection state keyed by `{peer_addr}_{pid}` in `CONNECTIONS`.
-///
-/// pgwire's `ClientInfo::metadata()` is `HashMap<String, String>`, so it can't
-/// hold an `Arc<TrinoClient>`. Once pgwire's `SessionExtensions` is released,
-/// this global map can be replaced.
+/// Per-connection state stored in pgwire's `SessionExtensions` map. Each
+/// PG connection holds a single `Arc<ConnectionState>`; pgwire drops it
+/// when the connection closes (normal exit, error, panic, drain abort),
+/// which fires `Drop for ConnectionState` to clean up the cancel-registry
+/// entry.
 pub struct ConnectionState {
     pub trino_client: Arc<TrinoClient>,
     pub config: Arc<Config>,
@@ -127,41 +141,9 @@ impl Drop for ConnectionState {
     }
 }
 
-static CONNECTIONS: LazyLock<DashMap<String, ConnectionState>> = LazyLock::new(DashMap::new);
-
-/// Metadata key under which each connection stores its `conn_id` on the
-/// pgwire `ClientInfo`.
-pub const CONNECTION_ID_KEY: &str = "_conn_id";
-
-pub fn register_connection(conn_id: String, state: ConnectionState) {
-    CONNECTIONS.insert(conn_id, state);
-}
-
-pub fn get_connection(
-    conn_id: &str,
-) -> Option<dashmap::mapref::one::Ref<'_, String, ConnectionState>> {
-    CONNECTIONS.get(conn_id)
-}
-
-/// Remove every entry whose key has `{addr}_` as a prefix.
-///
-/// Called via a drop guard in the per-connection spawn task so the entry is
-/// removed whether `process_socket` returns Ok, returns Err, or panics. The
-/// `(peer_ip, source_port)` tuple is unique among currently-established TCP
-/// connections, which is what makes the prefix match safe — the kernel will
-/// not reuse a tuple while a connection holding it is still active. After
-/// close, the tuple may sit in TIME_WAIT for tens of seconds before becoming
-/// reusable; cleanup here runs on connection-task exit, well before reuse.
-pub fn remove_connections_for_addr(addr: SocketAddr) {
-    let prefix = format!("{addr}_");
-    CONNECTIONS.retain(|key, _| !key.starts_with(&prefix));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
-    use std::sync::Arc;
     use trino_rust_client::ClientBuilder;
 
     /// Counter so each call gets a unique cancel_key — the dummy state's
@@ -173,51 +155,18 @@ mod tests {
         N.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn dummy_state() -> ConnectionState {
+    /// Cancel registry register / lookup / drop-driven cleanup all work
+    /// across the new `Mutex<HashMap>` storage.
+    #[test]
+    fn cancel_registry_lifecycle() {
         let client = Arc::new(ClientBuilder::new("u", "h").build().unwrap());
         let pid = next_test_pid();
         let secret = SecretKey::I32(pid);
-        let active_query_id = register_cancel(pid, secret.clone(), Arc::clone(&client));
-        ConnectionState {
-            trino_client: client,
-            config: Arc::new(Config {
-                listen_addr: "127.0.0.1:5432".to_owned(),
-                tls_cert: None,
-                tls_key: None,
-                trino_host: "h".to_owned(),
-                trino_port: 8080,
-                trino_catalog: "c".to_owned(),
-                trino_schema: "s".to_owned(),
-                trino_user: "u".to_owned(),
-                trino_ssl: false,
-                trino_tls_no_verify: false,
-                trino_allow_plaintext_auth: false,
-                auth: false,
-                allow_insecure_listener: false,
-                max_connections: 256,
-            }),
-            portals: Arc::new(Mutex::new(HashMap::new())),
-            active_query_id,
-            cancel_key: (pid, secret),
-        }
-    }
 
-    /// Addresses from RFC 5737 documentation ranges so the test won't collide
-    /// with real or future test entries in the global CONNECTIONS map.
-    #[test]
-    fn remove_by_addr_strips_only_matching_prefix() {
-        let a: SocketAddr = "192.0.2.1:11111".parse().unwrap();
-        let b: SocketAddr = "192.0.2.2:22222".parse().unwrap();
-        register_connection(format!("{a}_1"), dummy_state());
-        register_connection(format!("{a}_2"), dummy_state());
-        register_connection(format!("{b}_1"), dummy_state());
+        let _slot = register_cancel(pid, secret.clone(), Arc::clone(&client));
+        assert!(lookup_cancel(pid, &secret).is_some());
 
-        remove_connections_for_addr(a);
-
-        assert!(get_connection(&format!("{a}_1")).is_none());
-        assert!(get_connection(&format!("{a}_2")).is_none());
-        assert!(get_connection(&format!("{b}_1")).is_some());
-
-        remove_connections_for_addr(b);
+        unregister_cancel(pid, &secret);
+        assert!(lookup_cancel(pid, &secret).is_none());
     }
 }

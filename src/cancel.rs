@@ -26,26 +26,22 @@ pub struct GatewayCancelHandler;
 #[async_trait]
 impl CancelHandler for GatewayCancelHandler {
     async fn on_cancel_request(&self, req: CancelRequest) {
-        let entry = match session::lookup_cancel(req.pid, &req.secret_key) {
-            Some(e) => e,
-            None => {
-                tracing::debug!(
-                    pid = req.pid,
-                    "CancelRequest for unknown (pid, secret_key) — ignored"
-                );
-                return;
-            }
+        let Some((trino_client, active_query_id)) =
+            session::lookup_cancel(req.pid, &req.secret_key)
+        else {
+            tracing::debug!(
+                pid = req.pid,
+                "CancelRequest for unknown (pid, secret_key) — ignored"
+            );
+            return;
         };
 
-        // Snapshot the query id and trino-client handle, then drop the
-        // DashMap ref guard before the async cancel call — guards aren't
-        // Send and can't be held across awaits.
-        let trino_client = std::sync::Arc::clone(&entry.trino_client);
-        let query_id = match entry.active_query_id.lock() {
+        // `lookup_cancel` already cloned out the bits we need; the registry
+        // mutex was released inside it, so we're free to await below.
+        let query_id = match active_query_id.lock() {
             Ok(g) => g.clone(),
             Err(p) => p.into_inner().clone(),
         };
-        drop(entry);
 
         let Some(qid) = query_id else {
             tracing::debug!(

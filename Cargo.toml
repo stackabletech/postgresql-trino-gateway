@@ -10,7 +10,7 @@ repository = "https://github.com/stackabletech/postgresql-trino-gateway"
 keywords = ["postgresql", "trino", "gateway", "powerbi"]
 
 [dependencies]
-pgwire = "0.38"
+pgwire = "0.39"
 tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 futures = "0.3"
@@ -21,7 +21,6 @@ anyhow = "1"
 serde_json = "1"
 trino-rust-client = "0.9"
 async-stream = "0.3"
-dashmap = "6"
 sqlparser = { version = "0.61", features = ["visitor"] }
 rustls-pemfile = "2"
 rustls-pki-types = "1"

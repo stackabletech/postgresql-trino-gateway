@@ -15,7 +15,7 @@ use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 
 use crate::query_pipeline::process_query;
-use crate::session::{self, CachedPortalResponse, MAX_CACHED_PORTALS, PortalCache};
+use crate::session::{CachedPortalResponse, ConnectionState, MAX_CACHED_PORTALS, PortalCache};
 
 /// Handles the extended query protocol (Parse/Bind/Describe/Execute).
 ///
@@ -86,15 +86,11 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let query = &portal.statement.statement;
+        tracing::debug!(query, "Extended query execute");
 
-        let conn_id = client
-            .metadata()
-            .get(session::CONNECTION_ID_KEY)
-            .ok_or_else(|| PgWireError::ApiError("No connection ID in metadata".into()))?
-            .clone();
-        tracing::debug!(conn_id = %conn_id, query, "Extended query execute");
-
-        let conn_state = session::get_connection(&conn_id)
+        let conn_state = client
+            .session_extensions()
+            .get::<ConnectionState>()
             .ok_or_else(|| PgWireError::ApiError("Connection state not found".into()))?;
 
         // Take any response stashed by do_describe_portal. If the cached
@@ -104,23 +100,22 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         let cached_entry = take_cached(&conn_state.portals, &portal.name)?;
         if let Some(entry) = cached_entry {
             if entry.query == *query {
-                tracing::trace!(conn_id = %conn_id, portal = %portal.name, "Extended query execute: served from describe cache");
+                tracing::trace!(portal = %portal.name, "Extended query execute: served from describe cache");
                 return Ok(entry.response);
             }
             tracing::debug!(
-                conn_id = %conn_id,
                 portal = %portal.name,
                 "Discarding stale describe-cache entry — portal was re-bound"
             );
         }
 
-        let trino_client = Arc::clone(&conn_state.trino_client);
-        let config = Arc::clone(&conn_state.config);
-        let active_query_id = Arc::clone(&conn_state.active_query_id);
-        drop(conn_state);
-
-        let responses =
-            process_query(query, &trino_client, &config, Some(&active_query_id)).await?;
+        let responses = process_query(
+            query,
+            &conn_state.trino_client,
+            &conn_state.config,
+            Some(&conn_state.active_query_id),
+        )
+        .await?;
         let response = responses
             .into_iter()
             .next()
@@ -128,7 +123,6 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         match &response {
             Response::Query(qr) => {
                 tracing::trace!(
-                    conn_id = %conn_id,
                     portal = %portal.name,
                     columns = qr.row_schema.len(),
                     "Extended query execute: query response (no cache)"
@@ -136,7 +130,6 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
             }
             Response::Execution(_tag) => {
                 tracing::trace!(
-                    conn_id = %conn_id,
                     portal = %portal.name,
                     "Extended query execute: execution response (no cache)"
                 );
@@ -185,25 +178,20 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         // Run the pipeline once, return the schema, and stash the response so
         // do_query can serve Execute without re-running.
         let query = &portal.statement.statement;
+        tracing::debug!(query, "Extended query describe portal");
 
-        let conn_id = client
-            .metadata()
-            .get(session::CONNECTION_ID_KEY)
-            .ok_or_else(|| PgWireError::ApiError("No connection ID in metadata".into()))?
-            .clone();
-        tracing::debug!(conn_id = %conn_id, query, "Extended query describe portal");
-        let conn_state = session::get_connection(&conn_id)
+        let conn_state = client
+            .session_extensions()
+            .get::<ConnectionState>()
             .ok_or_else(|| PgWireError::ApiError("Connection state not found".into()))?;
-        let trino_client = Arc::clone(&conn_state.trino_client);
-        let config = Arc::clone(&conn_state.config);
-        // Clone the Arcs so we can use them after the .await below;
-        // conn_state is a DashMap ref-guard that can't be held across awaits.
-        let portals = Arc::clone(&conn_state.portals);
-        let active_query_id = Arc::clone(&conn_state.active_query_id);
-        drop(conn_state);
 
-        let responses =
-            process_query(query, &trino_client, &config, Some(&active_query_id)).await?;
+        let responses = process_query(
+            query,
+            &conn_state.trino_client,
+            &conn_state.config,
+            Some(&conn_state.active_query_id),
+        )
+        .await?;
         let response = responses
             .into_iter()
             .next()
@@ -228,7 +216,7 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         // Trino's `DELETE /v1/statement/{queryId}` so abandoned queries
         // release Trino resources promptly.
         insert_cached(
-            &portals,
+            &conn_state.portals,
             portal.name.clone(),
             CachedPortalResponse {
                 query: query.clone(),
