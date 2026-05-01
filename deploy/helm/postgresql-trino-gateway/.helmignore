@@ -1,0 +1,24 @@
+# Patterns to ignore when building packages.
+# Uses the same syntax as .gitignore.
+
+# Common backups, editor leftovers, OS noise.
+.DS_Store
+.git/
+.gitignore
+.bzr/
+.bzrignore
+.hg/
+.hgignore
+.svn/
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+# Helm itself.
+.project
+.idea/
+*.tmproj
+.vscode/
+# Per-chart README sources, if any.
+README.md.gotmpl
