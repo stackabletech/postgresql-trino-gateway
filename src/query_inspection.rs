@@ -158,6 +158,22 @@ impl ParsedQuery {
         found
     }
 
+    /// True if the query produces a result set (a `SELECT`, a `WITH`, a
+    /// values list, or a set-operation tree). Used by `do_describe_statement`
+    /// to decide whether running the pipeline at Describe time is safe —
+    /// for non-row-returning statements (`INSERT`, `UPDATE`, `DELETE`, DDL,
+    /// `SET`, ...) running the pipeline at Describe time would execute side
+    /// effects before the client has Bound and Executed.
+    ///
+    /// Returns `false` on parse failure (conservatively avoids running an
+    /// unparseable statement at Describe time).
+    pub fn returns_rows(&self) -> bool {
+        self.parsed
+            .as_ref()
+            .and_then(|stmts| stmts.first())
+            .is_some_and(|s| matches!(s, Statement::Query(_)))
+    }
+
     /// True if the query is `SELECT <expr> [AS alias]` with no FROM, WHERE,
     /// GROUP BY, ORDER BY, or other clauses, and exactly one projection item.
     ///

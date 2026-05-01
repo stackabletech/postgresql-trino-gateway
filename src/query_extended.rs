@@ -7,13 +7,16 @@ use async_trait::async_trait;
 use futures::Sink;
 use pgwire::api::portal::Portal;
 use pgwire::api::query::ExtendedQueryHandler;
-use pgwire::api::results::{DescribePortalResponse, DescribeStatementResponse, Response};
+use pgwire::api::results::{
+    DescribePortalResponse, DescribeResponse, DescribeStatementResponse, Response,
+};
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore, Type};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
 
+use crate::query_inspection::ParsedQuery;
 use crate::query_pipeline::process_query;
 use crate::session::{CachedPortalResponse, ConnectionState, MAX_CACHED_PORTALS, PortalCache};
 
@@ -146,7 +149,7 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
 
     async fn do_describe_statement<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         stmt: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
@@ -156,12 +159,53 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         tracing::trace!(statement = %stmt.statement, "Describe statement");
-        let param_types = stmt
+        let query = &stmt.statement;
+        let param_types: Vec<Type> = stmt
             .parameter_types
             .iter()
             .map(|t| t.clone().unwrap_or(Type::TEXT))
             .collect();
-        Ok(DescribeStatementResponse::new(param_types, vec![]))
+
+        // pgwire 0.39's `is_no_data` returns true when both `parameters`
+        // and `fields` are empty, in which case the framework sends a
+        // `NoData` reply. tokio-postgres takes its column schema from
+        // `Describe Statement`, so we must populate `fields` for queries
+        // that return rows or the client ends up with a zero-column
+        // Statement and `rows[0].get(0)` fails with "invalid column 0".
+        //
+        // For DML/DDL we return `no_data` without running the pipeline —
+        // running an INSERT/UPDATE at Describe time would execute side
+        // effects before Bind/Execute.
+        let parsed_query = ParsedQuery::new(query);
+        if !parsed_query.returns_rows() {
+            return Ok(DescribeStatementResponse::no_data());
+        }
+
+        let conn_state = client
+            .session_extensions()
+            .get::<ConnectionState>()
+            .ok_or_else(|| PgWireError::ApiError("Connection state not found".into()))?;
+
+        // Cost: one extra Trino round-trip per `prepare()` of a
+        // row-returning query. The result Stream is dropped here; Trino's
+        // server-side query state is freed via its own TTL (see TODO in
+        // `do_describe_portal` below for promoter cancellation).
+        let responses = process_query(
+            query,
+            &conn_state.trino_client,
+            &conn_state.config,
+            Some(&conn_state.active_query_id),
+        )
+        .await?;
+        let response = responses
+            .into_iter()
+            .next()
+            .ok_or_else(|| PgWireError::ApiError("Empty pipeline response".into()))?;
+        let fields = match &response {
+            Response::Query(qr) => qr.row_schema.as_ref().clone(),
+            _ => vec![],
+        };
+        Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
     async fn do_describe_portal<C>(
