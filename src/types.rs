@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 use pgwire::api::Type;
 use serde_json::Value;
 
@@ -94,6 +93,10 @@ fn scalar_to_array(scalar: &Type) -> Type {
 /// `42.0` would render as `"42.0"`, which PostgreSQL's int8 text parser rejects.
 /// For integer target types we force integer form via `as_i64`/`as_u64` so the
 /// wire value always matches the declared column type.
+///
+/// All values are emitted in the PostgreSQL **text** wire format. The
+/// gateway does not implement the binary wire format; see the
+/// "Wire format" section in `README.md` for why.
 pub fn encode_value(value: &Value, trino_type: &str) -> Option<String> {
     let base = base_type(trino_type);
     match value {
@@ -459,7 +462,10 @@ mod tests {
     fn encode_bigint_overflow_does_not_silently_saturate() {
         let val = serde_json::Value::Number(serde_json::Number::from_f64(1.0e30).unwrap());
         let encoded = encode_value(&val, "bigint").expect("must encode");
-        assert_ne!(encoded, "9223372036854775807", "must not saturate to i64::MAX");
+        assert_ne!(
+            encoded, "9223372036854775807",
+            "must not saturate to i64::MAX"
+        );
         let parsed: f64 = encoded.parse().expect("must be valid float text");
         assert!(
             (parsed - 1.0e30).abs() < 1.0e15,
@@ -471,9 +477,16 @@ mod tests {
     fn encode_bigint_negative_overflow_does_not_saturate() {
         let val = serde_json::Value::Number(serde_json::Number::from_f64(-1.0e30).unwrap());
         let encoded = encode_value(&val, "bigint").expect("must encode");
-        assert_ne!(encoded, i64::MIN.to_string(), "must not saturate to i64::MIN");
+        assert_ne!(
+            encoded,
+            i64::MIN.to_string(),
+            "must not saturate to i64::MIN"
+        );
         let parsed: f64 = encoded.parse().expect("must be valid float text");
-        assert!(parsed < 0.0 && parsed.abs() > 1.0e29, "expected large negative, got {parsed}");
+        assert!(
+            parsed < 0.0 && parsed.abs() > 1.0e29,
+            "expected large negative, got {parsed}"
+        );
     }
 
     #[test]
