@@ -4,8 +4,6 @@ A PostgreSQL wire-protocol shim in front of Trino. Power BI, Npgsql, JDBC,
 and `psql` connect to the gateway as if it were a PostgreSQL server; the
 gateway translates the queries and forwards them to Trino's REST API.
 
-Copyright 2026 Stackable GmbH. Licensed under OSL-3.0.
-
 ## Status
 
 Pre-1.0. The protocol surface is what Power BI Report Server exercises in
@@ -14,7 +12,7 @@ work for read queries; INSERT/UPDATE/CREATE TABLE work via simple-query
 and via prepared statements. Multi-statement batches are split and run one
 at a time. Wire format is text only.
 
-What is intentionally not implemented:
+What is intentionally not implemented for now:
 
 - SCRAM-SHA-256 (the gateway holds the cleartext password to forward as
   HTTP Basic auth to Trino, which doesn't compose with SCRAM).
@@ -110,6 +108,36 @@ the default 25-second connection drain on SIGTERM/SIGINT.
 `...=trace` adds the protocol-level decisions (intercept hits, response
 shapes). Row contents are never logged.
 
+## Logging and information disclosure
+
+The gateway distinguishes two output paths:
+
+- **What the client sees on error.** Trino error messages are sanitised
+  before being returned over the PG protocol: Java stack traces are
+  dropped, exception class FQNs (`io.trino.spi.TrinoException: ...`)
+  are stripped, hostnames inside `http://` / `https://` URLs are
+  replaced with `<trino>`, and the result is capped at 512 bytes. This
+  is to avoid leaking Trino-internal topology to PG clients that may
+  be on a less-trusted network.
+- **What goes into the gateway's own log stream.** Errors are logged
+  with the *original* (unsanitised) Trino message at `warn`/`error`
+  level so operators can debug. At `debug` and `trace` levels, the
+  gateway also logs every incoming SQL statement, every rewrite
+  decision, and the SQL it forwarded to Trino.
+
+What this means in practice: **the gateway log stream can contain
+sensitive information**. Trino error messages embed literal values from
+the failing query (`Cannot cast '2024-foo' as DATE`). Trace-level logs
+contain the query text itself, which may include identifiers or
+literals. Treat the gateway's stdout/stderr with the same operational
+sensitivity as Trino's own server log — restrict access, avoid
+forwarding it to general-purpose log aggregators without scrubbing,
+and review your log retention policy if your queries reference PII.
+
+The gateway never logs row contents (returned data values), only query
+text and Trino-side error messages. This is a deliberate boundary
+documented in `AGENTS.md`.
+
 ## What the gateway does to your SQL
 
 Most queries pass through unchanged. The rewriter handles the cases that
@@ -126,6 +154,9 @@ A handful of queries are intercepted and answered locally rather than
 forwarded:
 
 - `SET`, `SHOW`, `BEGIN`, `COMMIT`, `ROLLBACK`, `DISCARD`, `DEALLOCATE`.
+  Trino has no client-managed transactions, so `BEGIN`/`COMMIT`/`ROLLBACK`
+  are silently acknowledged as no-ops. Each statement runs in its own
+  Trino-side transaction; you cannot group multiple statements atomically.
 - `version()`, `current_database()`, `current_schema`,
   `pg_is_in_recovery()`, `current_setting('server_version[_num]')`.
 - `pg_catalog` queries used by Npgsql/pgjdbc for type loading
@@ -134,6 +165,39 @@ forwarded:
 - `INFORMATION_SCHEMA` tables Trino doesn't expose
   (`referential_constraints`, `table_constraints`, `key_column_usage`,
   ...) return zero rows with the right column shape.
+
+## Wire format
+
+The PostgreSQL frontend/backend protocol supports two wire encodings for
+column values: **text** and **binary**. Both are negotiated per column
+on each query — the client tells the server which format it wants for
+each result column, and the server obliges. Text format renders every
+value as its canonical PostgreSQL string representation (e.g. `42`,
+`true`, `2026-04-30`); binary format uses a compact, type-specific byte
+layout (e.g. a big-endian 4-byte integer for `int4`).
+
+This gateway emits **text only**. Two reasons:
+
+- **Compatibility.** Power BI Report Server uses Npgsql 4.0.17, whose
+  decoder for many composite/array types in binary format expects the
+  exact byte layout PostgreSQL 9.x produces. Trino's REST API hands us
+  values as JSON; reconstructing PostgreSQL's binary layout faithfully
+  for every type would be a large amount of error-prone code, and the
+  text form is what Npgsql's text decoder is happy with.
+- **Limited upside.** Binary format saves CPU and a small amount of
+  bytes for tight numeric workloads, but the gateway's bottleneck is
+  the Trino REST round-trip and JSON decode, not the wire encoding of
+  the final row. The gain wouldn't be visible in a real query path.
+
+The cost is that values cross the wire as decimal strings, ISO-format
+dates, and so on; clients that only support binary format won't work
+against the gateway. None of our documented clients (Power BI, Npgsql,
+pgjdbc, `psql`) require binary.
+
+If a future deployment needs binary format, the natural place to
+implement it is in `types.rs::encode_value` (per-column branch on the
+client-requested format code) and the `FieldFormat::Text` constants in
+`trino_stream.rs::build_pg_schema` and the catalog responders.
 
 ## Test
 
@@ -154,31 +218,3 @@ TRINO_WRITE_CATALOG=memory TRINO_WRITE_SCHEMA=default \
 
 `pre-commit run --all-files` runs the full battery (fmt, clippy, tests,
 cargo-deny, shellcheck, markdownlint) and is the gating check.
-
-## Project layout
-
-```
-src/
-  main.rs              CLI, TCP listener, accept loop, graceful shutdown
-  config.rs            Config (clap)
-  policy.rs            Startup auth/TLS/listener-policy validation
-  startup.rs           PG startup handler, auth, Trino client construction
-  tls.rs               TLS termination for the PG listener
-  handler.rs           PgWireServerHandlers factory
-  query_simple.rs      Simple query protocol handler
-  query_extended.rs    Extended query protocol handler (Parse/Bind/Describe/Execute)
-  query_pipeline.rs    Per-connection pipeline; multi-statement splitting
-  query_inspection.rs  AST-based dispatch (references_table, calls_function)
-  intercept.rs         SET/SHOW/transaction/server-function interception
-  cancel.rs            PG CancelRequest -> Trino DELETE /v1/query/{id}
-  session.rs           Per-connection state, cancel registry, portal cache
-  catalog/             pg_catalog emulation
-  rewrite/             SQL rewriting visitors
-  types.rs             Trino-to-PG type mapping and value encoding
-  trino_stream.rs      Streaming bridge (poll Trino, yield PG DataRow)
-  error_mapping.rs     Trino errors -> PG SQLSTATE codes
-tests/
-  integration_test.rs  Data-driven tests against a real Trino
-```
-
-`pgwire` and `trino-rust-client` come from crates.io; nothing is vendored.
