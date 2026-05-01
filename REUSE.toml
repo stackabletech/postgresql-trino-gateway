@@ -1,0 +1,16 @@
+version = 1
+SPDX-PackageName = "postgresql-trino-gateway"
+SPDX-PackageSupplier = "Stackable GmbH <info@stackable.tech>"
+SPDX-PackageDownloadLocation = "https://github.com/stackabletech/postgresql-trino-gateway"
+
+[[annotations]]
+path = ["**.md", "**.toml", "**.yaml", "**.yml", ".gitignore", ".markdownlint.yaml", ".pre-commit-config.yaml", "build.rs", "deploy/**", "docker/**", ".github/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Stackable GmbH"
+SPDX-License-Identifier = "OSL-3.0"
+
+[[annotations]]
+path = "Cargo.lock"
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 Stackable GmbH"
+SPDX-License-Identifier = "OSL-3.0"
