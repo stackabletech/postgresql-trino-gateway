@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -39,6 +38,11 @@ impl SimpleQueryHandler for GatewayQueryHandler {
         let trino_client = Arc::clone(&conn_state.trino_client);
         let config = Arc::clone(&conn_state.config);
         let active_query_id = Arc::clone(&conn_state.active_query_id);
+        // `conn_state` is a `dashmap::Ref` guard holding a read-lock on its
+        // shard; the guard is not `Send`, so it cannot be held across the
+        // `process_query(...).await` below. Drop it explicitly after we've
+        // cloned out the Arcs we need; otherwise the borrow-checker rejects
+        // the await.
         drop(conn_state);
 
         let result = process_query(query, &trino_client, &config, Some(&active_query_id)).await;

@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 use std::sync::Arc;
 
 use async_stream::stream;
@@ -80,12 +79,49 @@ fn extract_direct_rows(data: Option<QueryResultData<Row>>) -> Vec<Vec<Value>> {
     }
 }
 
-/// Submit a query to Trino and return (schema, row_stream).
+/// Submit a query to Trino and return `(schema, row_stream)`.
 ///
-/// The stream polls nextUri until done, yielding DataRow items suitable for
-/// pgwire's QueryResponse. If `active_query_id` is `Some`, the Trino query
-/// id from the initial response is recorded there so the cancel handler can
-/// issue `client.cancel(id)` against this connection's running query.
+/// # Streaming behaviour
+///
+/// The function does **not** buffer the full result set before yielding.
+/// Trino's REST API returns results as a chain of pages: the initial POST
+/// reply contains the first page (sometimes empty) and a `nextUri`; each
+/// GET on `nextUri` returns the next page and another `nextUri`, until
+/// `nextUri` is absent. Rows are decoded and yielded one at a time:
+///
+/// 1. The initial POST runs synchronously inside this function so the
+///    schema (`columns`) and any first-page rows are available before we
+///    return. Trino sometimes returns `columns: null` on the first reply
+///    and only exposes them on a subsequent page; we poll forward on
+///    behalf of the caller until columns appear.
+/// 2. Once we have a schema, we return immediately. The caller (pgwire)
+///    starts pulling `DataRow`s from the returned `Stream`.
+/// 3. Each pull yields one decoded row from the current page. When the
+///    current page is exhausted, the stream awaits the next GET and
+///    continues. Memory usage is bounded by one page at a time, regardless
+///    of total result-set size.
+///
+/// Pgwire writes each yielded `DataRow` to the client socket as it
+/// arrives, so a slow client back-pressures the Trino polling loop
+/// naturally — we don't queue rows in memory waiting for a recipient.
+///
+/// # Cancellation
+///
+/// If `active_query_id` is `Some`, the Trino query id from the initial
+/// response is recorded into that slot before we return, so a concurrent
+/// `CancelRequest` (handled in `cancel.rs`) can call
+/// `trino_client.cancel(id)` against the running query. The slot is
+/// cleared on stream end / drop / error via the `ClearOnDrop` guard
+/// inside the stream closure.
+///
+/// # Error paths
+///
+/// User-visible errors (Trino syntax, missing table, etc.) become
+/// `PgWireError::UserError` so the simple/extended-query handler turns
+/// them into a `Response::Error` to the client. Connection-level errors
+/// during page polling are yielded *into* the stream as the next item,
+/// matching pgwire's expectation that an in-flight stream surfaces its
+/// own failures rather than panicking.
 pub async fn execute_trino_query(
     client: &Arc<Client>,
     sql: String,

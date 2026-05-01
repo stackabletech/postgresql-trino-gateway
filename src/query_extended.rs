@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -20,7 +19,36 @@ use crate::session::{self, CachedPortalResponse, MAX_CACHED_PORTALS, PortalCache
 
 /// Handles the extended query protocol (Parse/Bind/Describe/Execute).
 ///
-/// Power BI uses Npgsql 4.0.17, which pipelines multiple
+/// # Background
+///
+/// PostgreSQL has two query protocols. The simple-query protocol (handled in
+/// `query_simple.rs`) sends one `Query` message containing a SQL string and
+/// gets back a result set; that's the path `psql` typically uses. The
+/// extended-query protocol splits that into four messages so that drivers can
+/// reuse a parsed statement, bind different parameters to it, and stream
+/// large result sets:
+///
+/// - `Parse` — the client sends SQL text and an optional name; the server
+///   parses it once into a *prepared statement*.
+/// - `Bind` — the client supplies parameter values and an optional name;
+///   the server creates a *portal*, which is a runnable instance of the
+///   prepared statement with concrete parameters bound.
+/// - `Describe` — the client asks for the column-shape (RowDescription) of
+///   either a prepared statement or a portal, before fetching rows.
+/// - `Execute` — the client tells the server to actually run the portal and
+///   stream rows back.
+///
+/// The same prepared statement can be `Bind`-ed to many portals; the same
+/// portal can be `Execute`-ed multiple times. Drivers (Npgsql, pgjdbc) use
+/// this protocol to load type metadata at connection time and to support
+/// real prepared statements at the application level.
+///
+/// For the full message-flow reference, see
+/// <https://www.postgresql.org/docs/current/protocol-flow.html#PROTOCOL-FLOW-EXT-QUERY>.
+///
+/// # Why the gateway needs `do_describe_portal` to run the pipeline
+///
+/// Power BI uses Npgsql 4.0.17 (released 2019), which pipelines multiple
 /// Parse/Bind/Describe/Execute sequences during type loading. We rely on
 /// pgwire's default `on_execute` (which sends DataRow WITHOUT
 /// RowDescription, `send_describe: false`); Npgsql gets the RowDescription
@@ -212,10 +240,7 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
     }
 }
 
-fn take_cached(
-    cache: &PortalCache,
-    name: &str,
-) -> PgWireResult<Option<CachedPortalResponse>> {
+fn take_cached(cache: &PortalCache, name: &str) -> PgWireResult<Option<CachedPortalResponse>> {
     let mut map = cache
         .lock()
         .map_err(|_| PgWireError::ApiError("portal cache mutex poisoned".into()))?;
