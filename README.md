@@ -207,19 +207,60 @@ client-requested format code) and the `FieldFormat::Text` constants in
 
 ## Test
 
+The repo has three kinds of tests, in increasing fidelity:
+
+1. **Unit tests (`cargo test --lib`).** ~191 tests inline in each
+   module. No Trino, no network, no subprocess. Run by default in CI
+   on every commit.
+2. **Integration tests via `tokio-postgres`
+   (`tests/integration_test.rs`).** ~30 tests that drive the gateway
+   over the real PG wire protocol using the Rust `tokio-postgres`
+   client. Each test spawns the gateway in-process on a random
+   port and connects to it. Tests that need a real Trino
+   automatically skip when `TRINO_HOST` is unset.
+3. **Integration tests via real `psql` (`tests/psql_integration_test.rs`).**
+   10 tests that drive the gateway by spawning the real `psql`
+   command-line client (libpq) as a subprocess. Catches client-
+   specific issues that an embedded driver wouldn't surface — startup
+   negotiation, notice handling, the simple-query-with-CommandComplete
+   flow. Slower per case (~50ms subprocess overhead) so kept to a
+   focused subset, not a full mirror of (2). Skipped automatically if
+   `psql` isn't on `PATH` or `TRINO_HOST` is unset.
+
 ```bash
-cargo test                                          # unit tests, no Trino
+# Unit tests only — no Trino required.
+cargo test --lib
+
+# All gates a PR must pass.
 cargo clippy --all-targets -- -D warnings           # lint
 cargo fmt --check                                   # format
+reuse lint                                          # license metadata
 
-# With Trino (read-only):
+# Read-only Trino integration (covers both client suites — tokio-postgres
+# tests in (2) auto-skip without TRINO_HOST; psql tests in (3) auto-skip
+# without TRINO_HOST and without `psql` on PATH).
 TRINO_HOST=... TRINO_PORT=... TRINO_SSL=true TRINO_TLS_NO_VERIFY=true \
     TRINO_CATALOG=tpch TRINO_SCHEMA=sf1 \
     cargo test
 
-# With DDL tests (needs a writable catalog like 'memory'):
-TRINO_WRITE_CATALOG=memory TRINO_WRITE_SCHEMA=default \
-    cargo test
+# Run only the tokio-postgres suite.
+cargo test --test integration_test
+
+# Run only the psql suite (needs postgresql-client installed).
+cargo test --test psql_integration_test
+
+# DDL tests in the tokio-postgres suite need a writable catalog
+# (e.g. 'memory'). Set TRINO_WRITE_CATALOG / TRINO_WRITE_SCHEMA in
+# addition to the read-only env vars above.
+TRINO_HOST=... TRINO_PORT=... TRINO_SSL=true TRINO_TLS_NO_VERIFY=true \
+    TRINO_CATALOG=tpch TRINO_SCHEMA=sf1 \
+    TRINO_WRITE_CATALOG=memory TRINO_WRITE_SCHEMA=default \
+    cargo test --test integration_test
+
+# Three tokio-postgres extended-protocol tests that depend on binary
+# wire format are `#[ignore]`-marked (see "Wire format" above). Run
+# them on demand once binary support lands:
+cargo test --test integration_test -- --ignored
 ```
 
 `pre-commit run --all-files` runs the full battery (fmt, clippy, tests,
