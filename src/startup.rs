@@ -223,20 +223,13 @@ impl GatewayStartupHandler {
         client.set_pid_and_secret_key(pid, secret_key.clone());
         let active_query_id =
             session::register_cancel(pid, secret_key.clone(), Arc::clone(&trino_client));
-        let conn_id = format!("{}_{}", client.socket_addr(), pid);
-        client
-            .metadata_mut()
-            .insert(session::CONNECTION_ID_KEY.to_owned(), conn_id.clone());
-        session::register_connection(
-            conn_id,
-            ConnectionState {
-                trino_client,
-                config: self.config.clone(),
-                portals: Default::default(),
-                active_query_id,
-                cancel_key: (pid, secret_key),
-            },
-        );
+        client.session_extensions().insert(ConnectionState {
+            trino_client,
+            config: self.config.clone(),
+            portals: Default::default(),
+            active_query_id,
+            cancel_key: (pid, secret_key),
+        });
         finish_authentication(client, &GatewayParameterProvider).await?;
         match user {
             Some(u) => {

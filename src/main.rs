@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2026 Stackable GmbH
 // SPDX-License-Identifier: OSL-3.0
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -15,7 +14,6 @@ use postgresql_trino_gateway::handler::GatewayHandlerFactory;
 use postgresql_trino_gateway::policy;
 use postgresql_trino_gateway::query_extended::GatewayExtendedQueryHandler;
 use postgresql_trino_gateway::query_simple::GatewayQueryHandler;
-use postgresql_trino_gateway::session;
 use postgresql_trino_gateway::startup::GatewayStartupHandler;
 use postgresql_trino_gateway::tls;
 
@@ -30,16 +28,6 @@ const SHUTDOWN_DRAIN_TIMEOUT_ENV: &str = "GATEWAY_SHUTDOWN_DRAIN_TIMEOUT_SECS";
 /// After `abort_all`, how long to wait for cancelled tasks to finish
 /// unwinding before letting the process exit.
 const ABORT_UNWIND_GRACE: Duration = Duration::from_secs(1);
-
-/// Drop guard that removes per-connection state when the connection task
-/// ends, including on panic or cancellation. Defined at module scope so the
-/// accept loop body stays readable.
-struct ConnectionCleanup(SocketAddr);
-impl Drop for ConnectionCleanup {
-    fn drop(&mut self) {
-        session::remove_connections_for_addr(self.0);
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -153,9 +141,8 @@ async fn main() -> anyhow::Result<()> {
                 let tls = tls_acceptor.clone();
                 tasks.spawn(async move {
                     let _permit = permit; // released on task exit
-                    let _guard = ConnectionCleanup(peer_addr);
                     if let Err(e) = pgwire::tokio::process_socket(socket, tls, factory).await {
-                        tracing::error!(error = %e, "connection error");
+                        tracing::error!(addr = %peer_addr, error = %e, "connection error");
                     }
                 });
             }
