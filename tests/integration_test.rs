@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 
 // This whole crate is test code; clippy doesn't recognise the async helper
 // functions as `#[test]`-annotated, so the test-allowance config in
@@ -1141,7 +1140,10 @@ async fn test_extended_catalog_intercept() {
     let addr = start_gateway(config).await;
     let client = connect(addr).await;
 
-    let stmt = client.prepare("SELECT oid, typname FROM pg_type LIMIT 5").await.unwrap();
+    let stmt = client
+        .prepare("SELECT oid, typname FROM pg_type LIMIT 5")
+        .await
+        .unwrap();
     let rows = client.query(&stmt, &[]).await.unwrap();
     assert!(!rows.is_empty(), "pg_type intercept should return rows");
 }

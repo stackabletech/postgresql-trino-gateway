@@ -55,6 +55,10 @@ TRINO_HOST=... TRINO_PORT=... TRINO_SSL=true TRINO_TLS_NO_VERIFY=true \
 # With writable catalog (DDL tests):
 ... TRINO_WRITE_CATALOG=memory TRINO_WRITE_SCHEMA=default \
   cargo test
+
+# Coverage (requires `cargo install cargo-llvm-cov`):
+cargo llvm-cov --all-targets --html
+# HTML report at target/llvm-cov/html/index.html
 ```
 
 ## Quality Rules

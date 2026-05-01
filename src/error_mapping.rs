@@ -1,7 +1,11 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 use pgwire::error::ErrorInfo;
+
+// What goes back to the client is sanitised; what goes into the gateway's
+// own logs is not. README's "Logging and information disclosure" section
+// describes the resulting trade-off — operators should treat the gateway
+// log stream as having the same sensitivity as Trino's own server log.
 
 /// Maximum length of the sanitised error message returned to the client.
 /// Trino errors with long single-line messages (e.g. catalogs of identifiers
@@ -295,7 +299,8 @@ mod tests {
 
     #[test]
     fn strips_nested_exception_wrappers() {
-        let msg = "io.trino.spi.TrinoException: io.trino.spi.PrestoException: Table 'foo' does not exist";
+        let msg =
+            "io.trino.spi.TrinoException: io.trino.spi.PrestoException: Table 'foo' does not exist";
         let info = trino_error_to_pg(msg);
         assert_eq!(info.message, "Table 'foo' does not exist");
     }

@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -130,6 +129,14 @@ async fn main() -> anyhow::Result<()> {
                 // the cap is reached we drop the socket immediately rather
                 // than queue the connection, so a flood of incoming SYNs
                 // can't pile up FD/memory pressure waiting for a slot.
+                //
+                // The PG protocol *does* allow a graceful refusal — an
+                // `ErrorResponse` (SQLSTATE 53300, `too_many_connections`)
+                // followed by a close — but issuing it requires reading
+                // the client's StartupMessage first, which itself consumes
+                // resources and defeats the SYN-flood mitigation above.
+                // Clients see a TCP close instead; the warning below makes
+                // the cause visible operator-side.
                 let permit = match Arc::clone(&connection_limit).try_acquire_owned() {
                     Ok(p) => p,
                     Err(_) => {
@@ -196,7 +203,11 @@ async fn drain(mut tasks: JoinSet<()>, timeout: Duration) {
     if in_flight == 0 {
         return;
     }
-    tracing::info!(in_flight, timeout_secs = timeout.as_secs(), "draining connections");
+    tracing::info!(
+        in_flight,
+        timeout_secs = timeout.as_secs(),
+        "draining connections"
+    );
 
     let drain_loop = async {
         while let Some(res) = tasks.join_next().await {

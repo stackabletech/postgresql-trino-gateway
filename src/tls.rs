@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 
 //! TLS termination for the PostgreSQL listening socket.
 //!
@@ -8,6 +7,15 @@
 //! returns a `TlsAcceptor` ready to hand to `pgwire::tokio::process_socket`.
 //!
 //! `aws-lc-rs` is used as the rustls crypto provider, attached explicitly
+//!
+//! # Implementation notes
+//!
+//! The `ServerConfig` is built with `ServerConfig::builder_with_provider`
+//! rather than `ServerConfig::builder` because the latter requires a
+//! process-level provider to be installed, which is not always the case
+//! when running in a container.
+//!
+//! The `ServerConfig` is built with `with_safe_default_protocol_versions`
 //! per `ServerConfig` rather than via the global default. This avoids the
 //! panic that `ServerConfig::builder()` raises when no process-level
 //! provider has been installed and removes the ordering coupling between

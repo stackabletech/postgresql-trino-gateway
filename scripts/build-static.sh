@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Stackable GmbH
+# SPDX-License-Identifier: OSL-3.0
 # Build a statically-linked binary using musl.
 # The resulting binary runs on any Linux (no glibc dependency).
 #

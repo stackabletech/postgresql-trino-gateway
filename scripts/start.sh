@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Stackable GmbH
+# SPDX-License-Identifier: OSL-3.0
 # Start the PostgreSQL-Trino Gateway.
 # Configure via environment variables or edit the defaults below.
 set -euo pipefail

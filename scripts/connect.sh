@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2026 Stackable GmbH
+# SPDX-License-Identifier: OSL-3.0
 # Connect to the gateway with psql for testing.
 set -euo pipefail
 

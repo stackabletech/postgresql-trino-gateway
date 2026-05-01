@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex};
@@ -27,6 +26,20 @@ pub struct CancelEntry {
 /// Map keyed by `(pid, secret_key)` (the pair pgwire sends in
 /// `BackendKeyData` and matches in a subsequent `CancelRequest`). Lives
 /// for the duration of the connection's session.
+///
+/// Cleanup runs on connection-task exit via two independent paths:
+///
+/// 1. `ConnectionCleanup` (a `Drop` guard in `main.rs` per spawned task)
+///    calls `remove_connections_for_addr`, which drops the
+///    `ConnectionState` for every `{addr}_{pid}` key matching this
+///    socket address.
+/// 2. `ConnectionState::Drop` (impl below) calls `unregister_cancel`,
+///    which removes the matching `CANCEL_REGISTRY` entry.
+///
+/// Both paths run on normal close, error return from `process_socket`,
+/// task panic, and `JoinSet::abort_all` (used by the shutdown drain).
+/// Idle TCP timeouts surface as a read error from the PG socket, which
+/// returns from `process_socket` and triggers (1).
 static CANCEL_REGISTRY: LazyLock<DashMap<(i32, SecretKey), CancelEntry>> =
     LazyLock::new(DashMap::new);
 

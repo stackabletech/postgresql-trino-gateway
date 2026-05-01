@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -17,9 +16,8 @@ pub struct Config {
 
     /// PEM-encoded TLS certificate chain for the listening socket. When set,
     /// `--tls-key` is also required. Without these flags the gateway speaks
-    /// plaintext PG protocol; do not pair plaintext with `--auth` on a
-    /// non-loopback bind. (Operator-side discipline for now — automatic
-    /// refusal is tracked under publication-checklist item A11.)
+    /// plaintext PG protocol; the auth/TLS posture matrix in `policy.rs`
+    /// refuses plaintext + `--auth` on a non-loopback bind at startup.
     #[arg(long, requires = "tls_key")]
     pub tls_cert: Option<PathBuf>,
 
