@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 use std::sync::Arc;
 
 use pgwire::api::Type;
@@ -9,7 +8,7 @@ use pgwire::error::{PgWireError, PgWireResult};
 use trino_rust_client::{Client, Row};
 
 use super::pg_class::table_oid;
-use super::{build_response, text_field};
+use super::{build_response, json_str, text_field};
 use crate::types::trino_type_to_pg;
 
 /// Query Trino's information_schema.columns and return a pg_attribute-compatible response.
@@ -41,9 +40,12 @@ pub async fn respond_pg_attribute(client: &Arc<Client>) -> PgWireResult<Vec<Resp
         let values = trino_row.into_json();
         // columns: table_schema (0), table_name (1), column_name (2),
         //          ordinal_position (3), is_nullable (4), data_type (5)
-        let schema_name = values.first().and_then(|v| v.as_str()).unwrap_or("public");
-        let tbl_name = values.get(1).and_then(|v| v.as_str()).unwrap_or("");
-        let col_name = values.get(2).and_then(|v| v.as_str()).unwrap_or("");
+        let schema_name = json_str(&values, 0, "public");
+        let tbl_name = json_str(&values, 1, "");
+        let col_name = json_str(&values, 2, "");
+        // Trino reports ordinal_position as a JSON number, but some
+        // information_schema bridges (e.g. legacy connectors) stringify it.
+        // Accept either form.
         let ordinal = values
             .get(3)
             .and_then(|v| {
@@ -51,8 +53,8 @@ pub async fn respond_pg_attribute(client: &Arc<Client>) -> PgWireResult<Vec<Resp
                     .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
             })
             .unwrap_or(0);
-        let is_nullable = values.get(4).and_then(|v| v.as_str()).unwrap_or("YES");
-        let data_type = values.get(5).and_then(|v| v.as_str()).unwrap_or("varchar");
+        let is_nullable = json_str(&values, 4, "YES");
+        let data_type = json_str(&values, 5, "varchar");
 
         let attrelid = table_oid(schema_name, tbl_name);
         let pg_type = trino_type_to_pg(data_type);

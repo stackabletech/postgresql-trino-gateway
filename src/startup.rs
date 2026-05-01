@@ -1,6 +1,5 @@
-// Copyright 2026 Stackable GmbH
-// Licensed under the Open Software License version 3.0 (OSL-3.0).
-// See LICENSE file in the project root for full license text.
+// SPDX-FileCopyrightText: 2026 Stackable GmbH
+// SPDX-License-Identifier: OSL-3.0
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -16,7 +15,6 @@ use pgwire::api::{ClientInfo, PgWireConnectionState};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::startup::{Authentication, SecretKey};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
-use rand::Rng;
 use trino_rust_client::auth::Auth;
 
 use crate::config::Config;
@@ -32,7 +30,7 @@ static CONNECTION_PID: AtomicI32 = AtomicI32::new(1);
 /// authorisation token for somebody else's connection.
 fn new_pid_and_secret_key() -> (i32, SecretKey) {
     let pid = CONNECTION_PID.fetch_add(1, Ordering::Relaxed);
-    let secret = rand::thread_rng().r#gen::<i32>();
+    let secret = rand::random::<i32>();
     (pid, SecretKey::I32(secret))
 }
 
@@ -142,31 +140,9 @@ impl StartupHandler for GatewayStartupHandler {
                         ))
                         .await?;
                 } else {
-                    // No auth — create Trino client immediately
+                    // No auth — create Trino client immediately and finish.
                     let trino_client = Arc::new(self.build_trino_client(None, None)?);
-                    let (pid, secret_key) = new_pid_and_secret_key();
-                    client.set_pid_and_secret_key(pid, secret_key.clone());
-                    let active_query_id = session::register_cancel(
-                        pid,
-                        secret_key.clone(),
-                        Arc::clone(&trino_client),
-                    );
-                    let conn_id = format!("{}_{}", client.socket_addr(), pid);
-                    client
-                        .metadata_mut()
-                        .insert(session::CONNECTION_ID_KEY.to_owned(), conn_id.clone());
-                    session::register_connection(
-                        conn_id,
-                        ConnectionState {
-                            trino_client,
-                            config: self.config.clone(),
-                            portals: Default::default(),
-                            active_query_id,
-                            cancel_key: (pid, secret_key),
-                        },
-                    );
-                    finish_authentication(client, &GatewayParameterProvider).await?;
-                    tracing::info!(addr = %client.socket_addr(), "client connected (no auth)");
+                    self.establish_session(client, trino_client, None).await?;
                 }
             }
             PgWireFrontendMessage::PasswordMessageFamily(pwd) => {
@@ -177,50 +153,35 @@ impl StartupHandler for GatewayStartupHandler {
                 let password = pwd.into_password()?;
                 let user = client.metadata().get("user").cloned().unwrap_or_default();
 
-                // Build Trino client with the PG client's credentials
+                // Build Trino client with the PG client's credentials.
                 let trino_client =
                     self.build_trino_client(Some(&user), Some(&password.password))?;
 
-                // Validate credentials by running a lightweight query against Trino.
-                // If Trino rejects the auth, we reject the PG connection immediately
-                // rather than letting the first real query fail with a confusing error.
+                // Validate credentials by running a lightweight query against
+                // Trino. We reject the PG connection here on any failure
+                // (auth rejection, network error, malformed reply, ...) so
+                // the client gets a clear failure during startup rather than
+                // a confusing error on its first real query. The error
+                // message is logged at the gateway with the underlying
+                // cause; the client gets the standard `InvalidPassword`
+                // response — distinguishing auth-failure from other failures
+                // requires inspecting `trino-rust-client`'s error enum and
+                // is tracked separately.
                 if let Err(e) = trino_client
                     .get::<trino_rust_client::Row>("SELECT 1".to_owned())
                     .await
                 {
-                    let msg = e.to_string();
                     tracing::warn!(
                         addr = %client.socket_addr(),
                         user = %user,
-                        "Trino authentication failed: {msg}"
+                        error = %e,
+                        "rejecting PG connection — Trino credential check failed (auth rejection, network error, or unreachable Trino)"
                     );
                     return Err(PgWireError::InvalidPassword(user));
                 }
 
-                let trino_client = Arc::new(trino_client);
-                let (pid, secret_key) = new_pid_and_secret_key();
-                client.set_pid_and_secret_key(pid, secret_key.clone());
-                let active_query_id = session::register_cancel(
-                    pid,
-                    secret_key.clone(),
-                    Arc::clone(&trino_client),
-                );
-                let conn_id = format!("{}_{}", client.socket_addr(), pid);
-                client
-                    .metadata_mut()
-                    .insert(session::CONNECTION_ID_KEY.to_owned(), conn_id.clone());
-                session::register_connection(
-                    conn_id,
-                    ConnectionState {
-                        trino_client,
-                        config: self.config.clone(),
-                        portals: Default::default(),
-                        active_query_id,
-                        cancel_key: (pid, secret_key),
-                    },
-                );
-                finish_authentication(client, &GatewayParameterProvider).await?;
-                tracing::info!(addr = %client.socket_addr(), user = %user, "client connected");
+                self.establish_session(client, Arc::new(trino_client), Some(user.as_str()))
+                    .await?;
             }
             _ => {
                 return Err(PgWireError::ApiError(
@@ -239,6 +200,51 @@ impl GatewayStartupHandler {
     /// are refused; see `policy::AuthPosture::CleartextRequiresTls`.
     fn tls_required(&self) -> bool {
         self.config.tls_cert.is_some() && self.config.tls_key.is_some()
+    }
+
+    /// Common per-connection setup once the Trino client has been built
+    /// and (for `--auth=true`) credentials have been verified. Allocates a
+    /// fresh `(pid, secret_key)`, registers the connection in the cancel
+    /// registry and the per-connection state map, and finishes the PG
+    /// startup handshake. `user` is `Some` only on the auth=true path,
+    /// where it's logged for operator visibility.
+    async fn establish_session<C>(
+        &self,
+        client: &mut C,
+        trino_client: Arc<trino_rust_client::Client>,
+        user: Option<&str>,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let (pid, secret_key) = new_pid_and_secret_key();
+        client.set_pid_and_secret_key(pid, secret_key.clone());
+        let active_query_id =
+            session::register_cancel(pid, secret_key.clone(), Arc::clone(&trino_client));
+        let conn_id = format!("{}_{}", client.socket_addr(), pid);
+        client
+            .metadata_mut()
+            .insert(session::CONNECTION_ID_KEY.to_owned(), conn_id.clone());
+        session::register_connection(
+            conn_id,
+            ConnectionState {
+                trino_client,
+                config: self.config.clone(),
+                portals: Default::default(),
+                active_query_id,
+                cancel_key: (pid, secret_key),
+            },
+        );
+        finish_authentication(client, &GatewayParameterProvider).await?;
+        match user {
+            Some(u) => {
+                tracing::info!(addr = %client.socket_addr(), user = %u, "client connected")
+            }
+            None => tracing::info!(addr = %client.socket_addr(), "client connected (no auth)"),
+        }
+        Ok(())
     }
 
     /// Build a Trino client, optionally with Basic auth credentials from the PG client.
