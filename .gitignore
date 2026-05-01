@@ -4,6 +4,8 @@
 TODO.md
 POWERBI_DEBUG.md
 PUBLICATION_CHECKLIST.md
+REVIEW_GUIDE.md
+TODO_TRIAGE.md
 
 # Reference checkouts of upstream projects kept on disk for grep/spelunking
 # during gateway development (pgwire, pgjdbc, npgsql, the Trino client, ...).
