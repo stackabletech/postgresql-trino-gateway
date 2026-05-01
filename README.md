@@ -136,7 +136,7 @@ sensitive information**. Trino error messages embed literal values from
 the failing query (`Cannot cast '2024-foo' as DATE`). Trace-level logs
 contain the query text itself, which may include identifiers or
 literals. Treat the gateway's stdout/stderr with the same operational
-sensitivity as Trino's own server log — restrict access, avoid
+sensitivity as Trino's own server log: restrict access, avoid
 forwarding it to general-purpose log aggregators without scrubbing,
 and review your log retention policy if your queries reference PII.
 
@@ -176,7 +176,7 @@ forwarded:
 
 The PostgreSQL frontend/backend protocol supports two wire encodings for
 column values: **text** and **binary**. Both are negotiated per column
-on each query — the client tells the server which format it wants for
+on each query: the client tells the server which format it wants for
 each result column, and the server obliges. Text format renders every
 value as its canonical PostgreSQL string representation (e.g. `42`,
 `true`, `2026-04-30`); binary format uses a compact, type-specific byte
@@ -222,14 +222,14 @@ The repo has three kinds of tests, in increasing fidelity:
    (`tests/psql_integration_test.rs`).** Drive the gateway by
    spawning the real `psql` command-line client (libpq) as a
    subprocess. Catches client-specific issues that an embedded driver
-   wouldn't surface — startup negotiation, notice handling, the
+   wouldn't surface: startup negotiation, notice handling, the
    simple-query-with-CommandComplete flow. Slower per case
    (subprocess overhead) so kept to a focused subset, not a full
    mirror of (2). Skipped automatically if `psql` isn't on `PATH` or
    `TRINO_HOST` is unset.
 
 ```bash
-# Unit tests only — no Trino required.
+# Unit tests only, no Trino required.
 cargo test --lib
 
 # All gates a PR must pass.
@@ -237,7 +237,7 @@ cargo clippy --all-targets -- -D warnings           # lint
 cargo fmt --check                                   # format
 reuse lint                                          # license metadata
 
-# Read-only Trino integration (covers both client suites — tokio-postgres
+# Read-only Trino integration (covers both client suites; tokio-postgres
 # tests in (2) auto-skip without TRINO_HOST; psql tests in (3) auto-skip
 # without TRINO_HOST and without `psql` on PATH).
 TRINO_HOST=... TRINO_PORT=... TRINO_SSL=true TRINO_TLS_NO_VERIFY=true \
