@@ -21,7 +21,9 @@
 #![allow(clippy::panic, clippy::unwrap_used)]
 
 use std::net::SocketAddr;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
+
+use tokio::process::Command;
 
 mod common;
 use common::{start_gateway, trino_config};
@@ -36,34 +38,66 @@ struct PsqlOutput {
 /// Run `psql -A -t -F$'\t' -c "{sql}"` against the gateway and return the
 /// captured stdout/stderr/exit. `-A` (no align), `-t` (tuples-only) and
 /// `-F` (deterministic field separator) give parseable output.
-fn run_psql(addr: SocketAddr, catalog: &str, sql: &str) -> PsqlOutput {
+async fn run_psql(addr: SocketAddr, catalog: &str, sql: &str) -> PsqlOutput {
+    let port = addr.port().to_string();
+    let host = addr.ip().to_string();
+    let args: Vec<&str> = vec![
+        "--no-psqlrc",
+        "-h",
+        &host,
+        "-p",
+        &port,
+        "-U",
+        "trino",
+        "-d",
+        catalog,
+        "-A", // no aligned output
+        "-t", // tuples-only (no header / footer)
+        "-F",
+        "\t",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-c",
+        sql,
+    ];
+
+    // Print the command before running so a hung test reveals what's
+    // actually being invoked. Shell-quote each arg so the line can be
+    // copy-pasted verbatim.
+    let quoted = args
+        .iter()
+        .map(|a| {
+            if a.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_=.,/:".contains(c))
+            {
+                (*a).to_string()
+            } else {
+                format!("'{}'", a.replace('\'', r"'\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    println!("$ PGPASSWORD='' psql {quoted}");
+
+    // Async tokio::process::Command, not std::process::Command. The
+    // sync version's `.output()` blocks the runtime thread; with
+    // `#[tokio::test]`'s default single-threaded runtime, that
+    // deadlocks against the in-process gateway's accept loop (which
+    // needs the same thread to schedule). The async `.output().await`
+    // parks the future so the runtime can keep serving the gateway
+    // while psql runs.
     let out = Command::new("psql")
-        .arg("--no-psqlrc") // ignore the user's ~/.psqlrc (noise like `\timing on`)
-        .arg("-h")
-        .arg(addr.ip().to_string())
-        .arg("-p")
-        .arg(addr.port().to_string())
-        .arg("-U")
-        .arg("trino")
-        .arg("-d")
-        .arg(catalog)
-        .arg("-A") // no aligned output
-        .arg("-t") // tuples-only (no header / footer)
-        .arg("-F")
-        .arg("\t")
-        .arg("-v")
-        .arg("ON_ERROR_STOP=1")
-        .arg("-c")
-        .arg(sql)
+        .args(&args)
         .env("PGPASSWORD", "") // auth is disabled in test_config
         // Without explicit `Stdio::null()` for stdin, psql inherits the
-        // cargo-test process's stdin (a pipe) and *blocks reading from it*
-        // forever — even with `-c`. Closing stdin makes psql exit as soon
-        // as the `-c` query finishes.
+        // test process's stdin and blocks reading from it forever —
+        // even with `-c`. Closing stdin makes psql exit as soon as the
+        // `-c` query finishes.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
+        .await
         .expect("failed to spawn psql; install postgresql-client");
     PsqlOutput {
         stdout: String::from_utf8_lossy(&out.stdout).to_string(),
@@ -73,7 +107,9 @@ fn run_psql(addr: SocketAddr, catalog: &str, sql: &str) -> PsqlOutput {
 }
 
 fn psql_available() -> bool {
-    Command::new("psql")
+    // One-time sync probe at test start; no async needed and no
+    // deadlock risk (gateway hasn't been started yet).
+    std::process::Command::new("psql")
         .arg("--version")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -110,7 +146,6 @@ fn skip_if_no_trino() -> Option<postgresql_trino_gateway::config::Config> {
 /// With our gateway pointing at a (running) Trino, psql's startup +
 /// simple-query path should round-trip cleanly.
 #[tokio::test]
-#[ignore = "psql subprocess hangs in test harness — debug in progress"]
 async fn psql_select_one() {
     if skip_if_no_psql() {
         return;
@@ -119,7 +154,7 @@ async fn psql_select_one() {
         return;
     };
     let addr = start_gateway(config).await;
-    let out = run_psql(addr, "tpch", "SELECT 1");
+    let out = run_psql(addr, "tpch", "SELECT 1").await;
     assert!(
         out.success,
         "psql failed: {}\nstderr: {}",
@@ -132,7 +167,6 @@ async fn psql_select_one() {
 /// answers locally without touching Trino. Verifies the intercept's
 /// RowDescription + DataRow flow with a real psql.
 #[tokio::test]
-#[ignore = "psql subprocess hangs in test harness — debug in progress"]
 async fn psql_show_server_version() {
     if skip_if_no_psql() {
         return;
@@ -141,7 +175,7 @@ async fn psql_show_server_version() {
         return;
     };
     let addr = start_gateway(config).await;
-    let out = run_psql(addr, "tpch", "SHOW server_version");
+    let out = run_psql(addr, "tpch", "SHOW server_version").await;
     assert!(out.success, "psql failed: {}", out.stderr);
     assert_eq!(out.stdout.trim(), "16.6");
 }
@@ -149,7 +183,6 @@ async fn psql_show_server_version() {
 /// `SELECT version()` exercises the bare-scalar-SELECT intercept. Same
 /// flow as above but through a different intercept branch.
 #[tokio::test]
-#[ignore = "psql subprocess hangs in test harness — debug in progress"]
 async fn psql_select_version() {
     if skip_if_no_psql() {
         return;
@@ -158,7 +191,7 @@ async fn psql_select_version() {
         return;
     };
     let addr = start_gateway(config).await;
-    let out = run_psql(addr, "tpch", "SELECT version()");
+    let out = run_psql(addr, "tpch", "SELECT version()").await;
     assert!(out.success, "psql failed: {}", out.stderr);
     assert!(
         out.stdout.contains("PostgreSQL 16.6"),
@@ -171,7 +204,6 @@ async fn psql_select_version() {
 /// these are intercepted as no-ops. psql's `-c` runs the whole batch in
 /// one simple-query message and expects per-statement CommandComplete.
 #[tokio::test]
-#[ignore = "psql subprocess hangs in test harness — debug in progress"]
 async fn psql_transaction_no_op_batch() {
     if skip_if_no_psql() {
         return;
@@ -180,7 +212,7 @@ async fn psql_transaction_no_op_batch() {
         return;
     };
     let addr = start_gateway(config).await;
-    let out = run_psql(addr, "tpch", "BEGIN; SELECT 1; COMMIT");
+    let out = run_psql(addr, "tpch", "BEGIN; SELECT 1; COMMIT").await;
     assert!(
         out.success,
         "psql failed: {}\nstderr: {}",
@@ -200,7 +232,6 @@ async fn psql_transaction_no_op_batch() {
 /// intercept that Power BI / Npgsql / pgjdbc rely on for type loading.
 /// Real psql receives the prebuilt static response.
 #[tokio::test]
-#[ignore = "psql subprocess hangs in test harness — debug in progress"]
 async fn psql_pg_type_intercept() {
     if skip_if_no_psql() {
         return;
@@ -209,7 +240,7 @@ async fn psql_pg_type_intercept() {
         return;
     };
     let addr = start_gateway(config).await;
-    let out = run_psql(addr, "tpch", "SELECT typname FROM pg_type LIMIT 1");
+    let out = run_psql(addr, "tpch", "SELECT typname FROM pg_type LIMIT 1").await;
     assert!(out.success, "psql failed: {}", out.stderr);
     assert!(
         !out.stdout.trim().is_empty(),
@@ -224,7 +255,6 @@ async fn psql_pg_type_intercept() {
 /// A real Trino-forwarded SELECT against TPC-H. Confirms the streaming
 /// bridge produces wire-correct DataRows for psql.
 #[tokio::test]
-#[ignore = "psql subprocess hangs in test harness — debug in progress"]
 async fn psql_trino_tpch_nation_count() {
     if skip_if_no_psql() {
         return;
@@ -233,7 +263,7 @@ async fn psql_trino_tpch_nation_count() {
         return;
     };
     let addr = start_gateway(config).await;
-    let out = run_psql(addr, "tpch", "SELECT COUNT(*) FROM tpch.sf1.nation");
+    let out = run_psql(addr, "tpch", "SELECT COUNT(*) FROM tpch.sf1.nation").await;
     assert!(
         out.success,
         "psql failed: {}\nstderr: {}",
@@ -250,7 +280,6 @@ async fn psql_trino_tpch_nation_count() {
 /// SQL rewrite — `ILIKE` becomes `lower() LIKE lower()`. psql sees the
 /// rewritten output but the query result is what matters.
 #[tokio::test]
-#[ignore = "psql subprocess hangs in test harness — debug in progress"]
 async fn psql_trino_ilike_rewrite() {
     if skip_if_no_psql() {
         return;
@@ -263,7 +292,8 @@ async fn psql_trino_ilike_rewrite() {
         addr,
         "tpch",
         "SELECT name FROM tpch.sf1.nation WHERE name ILIKE 'gER%'",
-    );
+    )
+    .await;
     assert!(
         out.success,
         "psql failed: {}\nstderr: {}",
@@ -280,7 +310,6 @@ async fn psql_trino_ilike_rewrite() {
 /// Multi-row, multi-column SELECT — verifies row separator and field
 /// separator handling at the psql side.
 #[tokio::test]
-#[ignore = "psql subprocess hangs in test harness — debug in progress"]
 async fn psql_trino_multi_row_multi_col() {
     if skip_if_no_psql() {
         return;
@@ -293,7 +322,8 @@ async fn psql_trino_multi_row_multi_col() {
         addr,
         "tpch",
         "SELECT regionkey, name FROM tpch.sf1.region ORDER BY regionkey",
-    );
+    )
+    .await;
     assert!(
         out.success,
         "psql failed: {}\nstderr: {}",
@@ -313,7 +343,6 @@ async fn psql_trino_multi_row_multi_col() {
 /// rewriter operates on the AST; a real psql client confirms the
 /// rewritten SQL still produces a correct wire response.
 #[tokio::test]
-#[ignore = "psql subprocess hangs in test harness — debug in progress"]
 async fn psql_trino_cast_rewrite() {
     if skip_if_no_psql() {
         return;
@@ -322,7 +351,7 @@ async fn psql_trino_cast_rewrite() {
         return;
     };
     let addr = start_gateway(config).await;
-    let out = run_psql(addr, "tpch", "SELECT (1 + 2)::int4 AS result");
+    let out = run_psql(addr, "tpch", "SELECT (1 + 2)::int4 AS result").await;
     assert!(
         out.success,
         "psql failed: {}\nstderr: {}",
@@ -335,7 +364,6 @@ async fn psql_trino_cast_rewrite() {
 /// forwards as ErrorResponse. psql exits non-zero with the message in
 /// stderr. Confirms the error-mapping path doesn't crash psql.
 #[tokio::test]
-#[ignore = "psql subprocess hangs in test harness — debug in progress"]
 async fn psql_trino_syntax_error_surfaces() {
     if skip_if_no_psql() {
         return;
@@ -344,7 +372,7 @@ async fn psql_trino_syntax_error_surfaces() {
         return;
     };
     let addr = start_gateway(config).await;
-    let out = run_psql(addr, "tpch", "SELECT * FROM no_such_table_at_all");
+    let out = run_psql(addr, "tpch", "SELECT * FROM no_such_table_at_all").await;
     assert!(
         !out.success,
         "expected non-zero exit; stdout: {}\nstderr: {}",
