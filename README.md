@@ -20,6 +20,12 @@ What is intentionally not implemented for now:
 - Per-IP rate limiting (only a global concurrent-connection cap).
 - Cancel of statements in a multi-statement batch other than the
   most-recently-submitted one.
+- Multi-replica / high-availability deployment. The cancel registry
+  and per-connection state are in-memory; running more than one
+  replica behind a load balancer needs sticky-by-connection routing
+  AND requires the PG `CancelRequest` to land on the same replica as
+  the original connection. The Helm chart defaults to `replicaCount:
+  1` and the Service is the single coordination point.
 
 ## Build
 
