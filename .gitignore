@@ -17,3 +17,8 @@ TODO_TRIAGE.md
 # Operator-local Trino config and ad-hoc debug captures.
 trino.yaml
 /debuglogs/
+
+# Wireshark / tcpdump captures — frequently contain customer data
+# (hostnames, IPs, query content). Keep out of the repo.
+*.pcap
+*.pcapng
