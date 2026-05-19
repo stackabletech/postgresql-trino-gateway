@@ -2,7 +2,19 @@
 // SPDX-License-Identifier: OSL-3.0
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{ArgAction, Parser};
+
+// clap's default action for `bool` is `SetTrue`: only the bare `--flag`
+// form is accepted, and `--flag=false` errors out. That's surprising for
+// operators used to `kubectl`/`helm`-style explicit-value flags. Every
+// boolean field below uses `num_args=0..=1` + `default_missing_value="true"`
+// + `ArgAction::Set` so all of these work:
+//   --flag        (bare; resolves to true via default_missing_value)
+//   --flag=true
+//   --flag=false
+//   --flag true   (space-separated)
+//   --flag false
+// Absence falls through to `default_value_t = false`.
 
 /// PostgreSQL-to-Trino gateway configuration.
 // WARNING: Debug is derived for clap compatibility. If credential fields
@@ -47,13 +59,13 @@ pub struct Config {
     pub trino_user: String,
 
     /// Use HTTPS to connect to Trino.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
     pub trino_ssl: bool,
 
     /// Skip TLS certificate-chain and hostname verification on the Trino
     /// connection. Useful with self-signed certs in a trusted network.
     /// Only meaningful with `--trino-ssl`.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
     pub trino_tls_no_verify: bool,
 
     /// Allow forwarding the PG client's password to Trino over plain
@@ -61,13 +73,13 @@ pub struct Config {
     /// (`--trino-ssl=false`); without it the Trino client refuses to send
     /// credentials. The password crosses the network in cleartext, so use
     /// only with a loopback or otherwise-trusted Trino endpoint.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
     pub trino_allow_plaintext_auth: bool,
 
     /// Require password authentication from PG clients.
     /// Credentials are forwarded to Trino as HTTP Basic auth.
     /// When disabled, connects to Trino with the --trino-user and no password.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
     pub auth: bool,
 
     /// Acknowledge that the gateway should accept unauthenticated PG
@@ -76,7 +88,7 @@ pub struct Config {
     /// every network-reachable client gets unauthenticated access to
     /// Trino as `--trino-user`. Use only when Trino itself enforces
     /// authentication or the network is otherwise trusted.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, num_args = 0..=1, default_missing_value = "true", action = ArgAction::Set)]
     pub allow_insecure_listener: bool,
 
     /// Maximum number of concurrent PG client connections. Excess

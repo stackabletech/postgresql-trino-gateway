@@ -95,10 +95,14 @@ pub fn classify(config: &Config) -> Result<AuthPosture> {
             return Ok(AuthPosture::DisabledOpenBind);
         }
         bail!(
-            "--auth=false on a non-loopback bind ({}) is not allowed by default. \
-             Either pass --auth (and --tls-cert/--tls-key for password protection) \
-             to require authentication, or pass --allow-insecure-listener to \
-             explicitly allow unauthenticated network access.",
+            "auth is disabled and the listen address ({}) is not loopback. \
+             That combination would expose Trino to every network-reachable client \
+             without authentication. Pick one of the following: \
+             (a) bind to 127.0.0.1 / [::1] / localhost for local development; \
+             (b) enable auth with `--auth` plus TLS via `--tls-cert` and `--tls-key`; \
+             (c) explicitly opt in to unauthenticated network access with \
+             `--allow-insecure-listener` (only when Trino itself authenticates \
+             or the network is otherwise trusted).",
             config.listen_addr
         )
     }
