@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use async_stream::stream;
 use futures::Stream;
+use pgwire::api::portal::Format;
 use pgwire::api::results::{DataRowEncoder, FieldFormat, FieldInfo};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::data::DataRow;
@@ -12,7 +13,7 @@ use trino_rust_client::models::{Column, QueryResultData};
 use trino_rust_client::{Client, Row};
 
 use crate::session::ActiveQueryId;
-use crate::types::{encode_value, trino_type_to_pg};
+use crate::types::{encode_cell, trino_type_to_pg};
 
 #[derive(Clone)]
 pub(crate) struct TrinoColumn {
@@ -29,17 +30,29 @@ impl From<&Column> for TrinoColumn {
     }
 }
 
-pub(crate) fn build_pg_schema(columns: &[TrinoColumn]) -> Arc<Vec<FieldInfo>> {
+/// Build the PG `RowDescription` schema for a Trino result set.
+///
+/// `result_format` is the per-column format the client bound for results;
+/// `None` means all-text (the simple-query protocol, which never negotiates
+/// binary). Each column's `FieldFormat` is taken from that request, so the
+/// schema drives both the advertised RowDescription and the per-cell encoding
+/// in `encode_row` — keeping them in lock-step.
+pub(crate) fn build_pg_schema(
+    columns: &[TrinoColumn],
+    result_format: Option<&Format>,
+) -> Arc<Vec<FieldInfo>> {
     Arc::new(
         columns
             .iter()
-            .map(|col| {
+            .enumerate()
+            .map(|(idx, col)| {
+                let format = result_format.map_or(FieldFormat::Text, |f| f.format_for(idx));
                 FieldInfo::new(
                     col.name.clone(),
                     None,
                     None,
                     trino_type_to_pg(&col.trino_type),
-                    FieldFormat::Text,
+                    format,
                 )
             })
             .collect(),
@@ -52,8 +65,15 @@ pub(crate) fn encode_row(
     schema: &Arc<Vec<FieldInfo>>,
 ) -> PgWireResult<DataRow> {
     let mut encoder = DataRowEncoder::new(schema.clone());
-    for (value, col) in values.iter().zip(columns.iter()) {
-        encoder.encode_field(&encode_value(value, &col.trino_type))?;
+    for (idx, (value, col)) in values.iter().zip(columns.iter()).enumerate() {
+        let field = &schema[idx];
+        encode_cell(
+            &mut encoder,
+            value,
+            field.datatype(),
+            &col.trino_type,
+            field.format(),
+        )?;
     }
     Ok(encoder.take_row())
 }
@@ -126,6 +146,7 @@ pub async fn execute_trino_query(
     client: &Arc<Client>,
     sql: String,
     active_query_id: Option<&ActiveQueryId>,
+    result_format: Option<&Format>,
 ) -> Result<
     (
         Arc<Vec<FieldInfo>>,
@@ -200,7 +221,7 @@ pub async fn execute_trino_query(
 
     // Empty schema means DDL/DML; the caller returns Response::Execution
     // instead of Response::Query.
-    let schema = build_pg_schema(&trino_columns);
+    let schema = build_pg_schema(&trino_columns, result_format);
 
     let stream_client = Arc::clone(client);
     let stream_columns = trino_columns.clone();
@@ -298,7 +319,7 @@ mod tests {
                 trino_type: "varchar".to_owned(),
             },
         ];
-        let schema = build_pg_schema(&columns);
+        let schema = build_pg_schema(&columns, None);
         assert_eq!(schema.len(), 2);
         assert_eq!(schema[0].name(), "id");
         assert_eq!(*schema[0].datatype(), Type::INT4);
@@ -318,7 +339,7 @@ mod tests {
                 trino_type: "varchar".to_owned(),
             },
         ];
-        let schema = build_pg_schema(&columns);
+        let schema = build_pg_schema(&columns, None);
         let values = vec![json!(42), json!("alice")];
 
         let row = encode_row(&values, &columns, &schema);
@@ -331,7 +352,7 @@ mod tests {
             name: "val".to_owned(),
             trino_type: "varchar".to_owned(),
         }];
-        let schema = build_pg_schema(&columns);
+        let schema = build_pg_schema(&columns, None);
         let values = vec![Value::Null];
 
         let row = encode_row(&values, &columns, &schema);

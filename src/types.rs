@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Stackable GmbH
 // SPDX-License-Identifier: OSL-3.0
+use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 use pgwire::api::Type;
+use pgwire::api::results::{DataRowEncoder, FieldFormat};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use rust_decimal::Decimal;
 use serde_json::Value;
 
 /// Parametric types (`varchar(100)`, `decimal(10,2)`) are handled by
@@ -160,6 +164,223 @@ fn encode_number(n: &serde_json::Number, base: &str) -> String {
         }
         _ => n.to_string(),
     }
+}
+
+/// Encode one result-set cell into `encoder`, honoring the wire `format`
+/// the client requested for this column in its `Bind` message.
+///
+/// Text columns keep the string-rendering path (`encode_value`). Binary
+/// columns are converted to the appropriate typed Rust value so pgwire's
+/// `DataRowEncoder` — which picks text vs binary from the column's
+/// `FieldFormat` — emits PostgreSQL's binary wire layout. SQL NULL encodes
+/// identically in both formats (a -1 length with no payload), so it is
+/// handled once here regardless of format.
+///
+/// Binary encoding is implemented for the scalar types that binary-requesting
+/// drivers (Power BI's Npgsql, Tableau/pgjdbc, tokio-postgres) actually ask
+/// for: bool, the integer and floating types, numeric, date / time /
+/// timestamp (without time zone), and the string family (whose binary and
+/// text wire forms are identical). Any *other* type requested in binary fails
+/// closed with SQLSTATE 0A000 rather than emitting bytes the client would
+/// misread — we cannot silently fall back to text because the client decodes
+/// strictly per the format it bound. See TODO.md "Binary result-format".
+pub fn encode_cell(
+    encoder: &mut DataRowEncoder,
+    value: &Value,
+    pg_type: &Type,
+    trino_type: &str,
+    format: FieldFormat,
+) -> PgWireResult<()> {
+    // NULL is format-independent on the wire (-1 length, no payload).
+    if value.is_null() {
+        return encoder.encode_field(&None::<&str>);
+    }
+    match format {
+        FieldFormat::Text => encoder.encode_field(&encode_value(value, trino_type)),
+        FieldFormat::Binary => encode_binary_cell(encoder, value, pg_type, trino_type),
+    }
+}
+
+/// Binary-encode a non-NULL value for the column's PostgreSQL type. See
+/// `encode_cell` for the supported-type policy and the fail-closed rationale.
+fn encode_binary_cell(
+    encoder: &mut DataRowEncoder,
+    value: &Value,
+    pg_type: &Type,
+    trino_type: &str,
+) -> PgWireResult<()> {
+    let t = pg_type;
+    if *t == Type::BOOL {
+        encoder.encode_field(&json_to_bool(value, trino_type)?)
+    } else if *t == Type::INT2 {
+        let n = json_to_i64(value, trino_type)?;
+        let v = i16::try_from(n).map_err(|_| out_of_range(n, "int2"))?;
+        encoder.encode_field(&v)
+    } else if *t == Type::INT4 {
+        let n = json_to_i64(value, trino_type)?;
+        let v = i32::try_from(n).map_err(|_| out_of_range(n, "int4"))?;
+        encoder.encode_field(&v)
+    } else if *t == Type::INT8 {
+        encoder.encode_field(&json_to_i64(value, trino_type)?)
+    } else if *t == Type::FLOAT4 {
+        encoder.encode_field(&(json_to_f64(value, trino_type)? as f32))
+    } else if *t == Type::FLOAT8 {
+        encoder.encode_field(&json_to_f64(value, trino_type)?)
+    } else if *t == Type::NUMERIC {
+        encoder.encode_field(&json_to_decimal(value, trino_type)?)
+    } else if *t == Type::TIMESTAMP {
+        encoder.encode_field(&json_to_timestamp(value, trino_type)?)
+    } else if *t == Type::DATE {
+        encoder.encode_field(&json_to_date(value, trino_type)?)
+    } else if *t == Type::TIME {
+        encoder.encode_field(&json_to_time(value, trino_type)?)
+    } else if *t == Type::VARCHAR
+        || *t == Type::TEXT
+        || *t == Type::BPCHAR
+        || *t == Type::NAME
+        || *t == Type::UNKNOWN
+    {
+        // varchar/text/char/name share an identical text and binary wire
+        // layout (the raw UTF-8 bytes), so the rendered string is already the
+        // correct binary payload.
+        encoder.encode_field(&encode_value(value, trino_type))
+    } else {
+        Err(unsupported_binary_type(pg_type, trino_type))
+    }
+}
+
+fn json_to_bool(value: &Value, trino_type: &str) -> PgWireResult<bool> {
+    match value {
+        Value::Bool(b) => Ok(*b),
+        Value::String(s) if s == "true" => Ok(true),
+        Value::String(s) if s == "false" => Ok(false),
+        _ => Err(conversion_error("boolean", trino_type)),
+    }
+}
+
+/// Trino sends integers as JSON numbers, but occasionally as strings to
+/// preserve precision. Accept both, plus whole-valued floats (`42.0`).
+fn json_to_i64(value: &Value, trino_type: &str) -> PgWireResult<i64> {
+    match value {
+        Value::Number(n) => n
+            .as_i64()
+            .or_else(|| n.as_u64().and_then(|u| i64::try_from(u).ok()))
+            .or_else(|| n.as_f64().and_then(f64_to_i64_exact))
+            .ok_or_else(|| conversion_error("integer", trino_type)),
+        Value::String(s) => s
+            .trim()
+            .parse::<i64>()
+            .ok()
+            .or_else(|| s.trim().parse::<f64>().ok().and_then(f64_to_i64_exact))
+            .ok_or_else(|| conversion_error("integer", trino_type)),
+        _ => Err(conversion_error("integer", trino_type)),
+    }
+}
+
+/// Convert a float to i64 only when it is integral and in range; otherwise
+/// `None` so the caller fails closed rather than silently truncating.
+fn f64_to_i64_exact(f: f64) -> Option<i64> {
+    if f.fract() == 0.0 && f >= i64::MIN as f64 && f < i64::MAX as f64 {
+        Some(f as i64)
+    } else {
+        None
+    }
+}
+
+fn json_to_f64(value: &Value, trino_type: &str) -> PgWireResult<f64> {
+    match value {
+        Value::Number(n) => n
+            .as_f64()
+            .ok_or_else(|| conversion_error("float", trino_type)),
+        // Trino serializes non-finite floats as strings.
+        Value::String(s) => match s.trim() {
+            "NaN" => Ok(f64::NAN),
+            "Infinity" => Ok(f64::INFINITY),
+            "-Infinity" => Ok(f64::NEG_INFINITY),
+            other => other
+                .parse::<f64>()
+                .map_err(|_| conversion_error("float", trino_type)),
+        },
+        _ => Err(conversion_error("float", trino_type)),
+    }
+}
+
+/// Trino returns DECIMAL as a string to preserve precision. `from_str_exact`
+/// rejects values that exceed `rust_decimal`'s ~28-digit capacity, so we fail
+/// closed instead of silently losing precision.
+fn json_to_decimal(value: &Value, trino_type: &str) -> PgWireResult<Decimal> {
+    let s = match value {
+        Value::String(s) => s.clone(),
+        Value::Number(n) => n.to_string(),
+        _ => return Err(conversion_error("numeric", trino_type)),
+    };
+    Decimal::from_str_exact(s.trim()).map_err(|_| conversion_error("numeric", trino_type))
+}
+
+fn json_to_timestamp(value: &Value, trino_type: &str) -> PgWireResult<NaiveDateTime> {
+    let s = value
+        .as_str()
+        .ok_or_else(|| conversion_error("timestamp", trino_type))?
+        .trim();
+    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
+        .map_err(|_| conversion_error("timestamp", trino_type))
+}
+
+fn json_to_date(value: &Value, trino_type: &str) -> PgWireResult<NaiveDate> {
+    let s = value
+        .as_str()
+        .ok_or_else(|| conversion_error("date", trino_type))?
+        .trim();
+    NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| conversion_error("date", trino_type))
+}
+
+fn json_to_time(value: &Value, trino_type: &str) -> PgWireResult<NaiveTime> {
+    let s = value
+        .as_str()
+        .ok_or_else(|| conversion_error("time", trino_type))?
+        .trim();
+    NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
+        .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S"))
+        .map_err(|_| conversion_error("time", trino_type))
+}
+
+/// A value Trino returned could not be converted to the target PG type's
+/// binary form. SQLSTATE 22P03 = invalid_binary_representation. The offending
+/// value is deliberately not included (it may carry sensitive data).
+fn conversion_error(target: &str, trino_type: &str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "22P03".to_owned(),
+        format!("gateway could not encode a Trino {trino_type} value as binary {target}"),
+    )))
+}
+
+/// An integer value did not fit the narrower PG integer type. SQLSTATE
+/// 22003 = numeric_value_out_of_range.
+fn out_of_range(value: i64, target: &str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "22003".to_owned(),
+        format!("value {value} out of range for binary {target}"),
+    )))
+}
+
+/// The client requested binary results for a column whose type the gateway
+/// cannot yet encode in binary. SQLSTATE 0A000 = feature_not_supported.
+fn unsupported_binary_type(pg_type: &Type, trino_type: &str) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "0A000".to_owned(),
+        format!(
+            "binary wire format for column type {} (Trino {}) is not supported by the gateway; \
+             the client requested binary results for this column",
+            pg_type.name(),
+            trino_type
+        ),
+    )))
 }
 
 /// PostgreSQL's canonical text form for f64 special values.
@@ -539,5 +760,204 @@ mod tests {
         let result = encode_value(&val, "map");
         assert!(result.is_some());
         assert_eq!(result.unwrap(), r#"{"key":"value"}"#);
+    }
+
+    // -- binary wire format (encode_cell) --
+
+    use pgwire::api::results::FieldInfo;
+    use serde_json::json;
+    use std::sync::Arc;
+
+    /// Encode one value as a single-column row with the given pg type and wire
+    /// format, returning the field payload: `None` for SQL NULL, else the
+    /// bytes after the 4-byte length prefix.
+    fn encode_one(
+        value: &Value,
+        pg_type: Type,
+        trino_type: &str,
+        format: FieldFormat,
+    ) -> PgWireResult<Option<Vec<u8>>> {
+        let schema = Arc::new(vec![FieldInfo::new(
+            "c".to_owned(),
+            None,
+            None,
+            pg_type.clone(),
+            format,
+        )]);
+        let mut encoder = DataRowEncoder::new(schema);
+        encode_cell(&mut encoder, value, &pg_type, trino_type, format)?;
+        let row = encoder.take_row();
+        let data = &row.data;
+        let len = i32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        if len < 0 {
+            return Ok(None);
+        }
+        Ok(Some(data[4..4 + len as usize].to_vec()))
+    }
+
+    fn bin(value: &Value, pg_type: Type, trino_type: &str) -> Vec<u8> {
+        encode_one(value, pg_type, trino_type, FieldFormat::Binary)
+            .expect("binary encode should succeed")
+            .expect("non-null value")
+    }
+
+    #[test]
+    fn binary_int4_is_big_endian_4_bytes() {
+        assert_eq!(bin(&json!(42), Type::INT4, "integer"), vec![0, 0, 0, 42]);
+    }
+
+    #[test]
+    fn binary_int8_is_big_endian_8_bytes() {
+        assert_eq!(
+            bin(&json!(1), Type::INT8, "bigint"),
+            vec![0, 0, 0, 0, 0, 0, 0, 1]
+        );
+    }
+
+    #[test]
+    fn binary_int2_from_smallint() {
+        assert_eq!(bin(&json!(7), Type::INT2, "smallint"), vec![0, 7]);
+    }
+
+    #[test]
+    fn binary_int8_from_json_string() {
+        // Trino may send bigint as a JSON string to preserve precision.
+        assert_eq!(
+            bin(&json!("255"), Type::INT8, "bigint"),
+            vec![0, 0, 0, 0, 0, 0, 0, 255]
+        );
+    }
+
+    #[test]
+    fn binary_float8_matches_ieee754_be() {
+        assert_eq!(
+            bin(&json!(1.5), Type::FLOAT8, "double"),
+            1.5f64.to_be_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn binary_float4_matches_ieee754_be() {
+        assert_eq!(
+            bin(&json!(1.5), Type::FLOAT4, "real"),
+            1.5f32.to_be_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn binary_float8_nan_from_string() {
+        // Trino serializes non-finite floats as strings.
+        let bytes = bin(&json!("NaN"), Type::FLOAT8, "double");
+        let f = f64::from_be_bytes(bytes.try_into().expect("8 bytes"));
+        assert!(f.is_nan());
+    }
+
+    #[test]
+    fn binary_bool_true_is_one_byte() {
+        assert_eq!(bin(&json!(true), Type::BOOL, "boolean"), vec![1]);
+        assert_eq!(bin(&json!(false), Type::BOOL, "boolean"), vec![0]);
+    }
+
+    #[test]
+    fn binary_timestamp_is_micros_since_2000() {
+        // PostgreSQL binary timestamp = i64 microseconds since 2000-01-01.
+        let epoch = NaiveDate::from_ymd_opt(2000, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap();
+        let ts = NaiveDate::from_ymd_opt(2026, 6, 1)
+            .unwrap()
+            .and_hms_opt(10, 30, 0)
+            .unwrap();
+        let expected = (ts - epoch).num_microseconds().unwrap();
+        let bytes = bin(
+            &json!("2026-06-01 10:30:00.000000"),
+            Type::TIMESTAMP,
+            "timestamp(6)",
+        );
+        assert_eq!(
+            i64::from_be_bytes(bytes.try_into().expect("8 bytes")),
+            expected
+        );
+    }
+
+    #[test]
+    fn binary_timestamp_without_fraction_parses() {
+        let bytes = bin(&json!("2026-06-01 10:30:00"), Type::TIMESTAMP, "timestamp");
+        assert_eq!(bytes.len(), 8);
+    }
+
+    #[test]
+    fn binary_numeric_round_trips_via_decimal() {
+        // 4-byte count of base-10000 digit groups means a non-empty payload;
+        // we just assert it encodes (correctness of the digit layout is
+        // postgres-types' responsibility) and that an over-precise value
+        // fails closed.
+        assert!(!bin(&json!("123.45"), Type::NUMERIC, "decimal(10,2)").is_empty());
+    }
+
+    #[test]
+    fn binary_numeric_rejects_overprecise_value() {
+        // Exceeds rust_decimal's capacity → fail closed rather than corrupt.
+        let huge = "1".repeat(40);
+        let err = encode_one(
+            &json!(huge),
+            Type::NUMERIC,
+            "decimal(38,0)",
+            FieldFormat::Binary,
+        );
+        assert!(err.is_err(), "over-precise decimal must fail closed");
+    }
+
+    #[test]
+    fn binary_varchar_is_raw_utf8_bytes() {
+        // varchar binary == text bytes.
+        assert_eq!(
+            bin(&json!("hello"), Type::VARCHAR, "varchar"),
+            b"hello".to_vec()
+        );
+    }
+
+    #[test]
+    fn binary_null_is_negative_one_length() {
+        // NULL is format-independent: -1 length, no payload.
+        let out = encode_one(&Value::Null, Type::INT4, "integer", FieldFormat::Binary).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn binary_int4_overflow_fails_closed() {
+        let too_big = json!(i64::from(i32::MAX) + 1);
+        let res = encode_one(&too_big, Type::INT4, "integer", FieldFormat::Binary);
+        assert!(res.is_err(), "out-of-range int4 must fail closed");
+    }
+
+    #[test]
+    fn binary_unsupported_type_fails_closed() {
+        // INTERVAL has no binary encoder yet → fail closed, not silent text.
+        let res = encode_one(
+            &json!("1 day"),
+            Type::INTERVAL,
+            "interval",
+            FieldFormat::Binary,
+        );
+        assert!(res.is_err(), "unsupported binary type must fail closed");
+    }
+
+    #[test]
+    fn text_path_still_renders_strings() {
+        // The text branch is unchanged: int4 in text is the ASCII digits.
+        assert_eq!(
+            encode_one(&json!(42), Type::INT4, "integer", FieldFormat::Text)
+                .unwrap()
+                .unwrap(),
+            b"42".to_vec()
+        );
+    }
+
+    #[test]
+    fn text_path_null_is_negative_one_length() {
+        let out = encode_one(&Value::Null, Type::VARCHAR, "varchar", FieldFormat::Text).unwrap();
+        assert!(out.is_none());
     }
 }

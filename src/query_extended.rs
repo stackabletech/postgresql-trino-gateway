@@ -117,6 +117,7 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
             &conn_state.trino_client,
             &conn_state.config,
             Some(&conn_state.active_query_id),
+            Some(&portal.result_column_format),
         )
         .await?;
         let response = responses
@@ -190,11 +191,16 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         // row-returning query. The result Stream is dropped here; Trino's
         // server-side query state is freed via its own TTL (see TODO in
         // `do_describe_portal` below for promoter cancellation).
+        //
+        // The result format isn't known at Describe-Statement time (no Bind
+        // yet), so the RowDescription is built as text; the actual per-column
+        // format is applied later in do_query against the bound portal.
         let responses = process_query(
             query,
             &conn_state.trino_client,
             &conn_state.config,
             Some(&conn_state.active_query_id),
+            None,
         )
         .await?;
         let response = responses
@@ -234,6 +240,7 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
             &conn_state.trino_client,
             &conn_state.config,
             Some(&conn_state.active_query_id),
+            Some(&portal.result_column_format),
         )
         .await?;
         let response = responses

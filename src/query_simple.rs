@@ -31,11 +31,14 @@ impl SimpleQueryHandler for GatewayQueryHandler {
             .get::<ConnectionState>()
             .ok_or_else(|| PgWireError::ApiError("Connection state not found".into()))?;
 
+        // The simple-query protocol always uses text wire format; it never
+        // negotiates per-column binary results.
         let result = process_query(
             query,
             &conn_state.trino_client,
             &conn_state.config,
             Some(&conn_state.active_query_id),
+            None,
         )
         .await;
         match &result {

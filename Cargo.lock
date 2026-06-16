@@ -1676,6 +1676,7 @@ dependencies = [
  "pgwire",
  "rand 0.10.1",
  "rcgen",
+ "rust_decimal",
  "rustls-pki-types",
  "serde_json",
  "sqlparser",

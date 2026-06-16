@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: OSL-3.0
 use std::sync::Arc;
 
+use pgwire::api::portal::Format;
 use pgwire::api::results::{QueryResponse, Response, Tag};
 use pgwire::error::{PgWireError, PgWireResult};
 use sqlparser::dialect::PostgreSqlDialect;
@@ -38,23 +39,37 @@ use crate::trino_stream::execute_trino_query;
 /// returns; cancelling them after later statements have submitted is not
 /// supported, but no documented client (Power BI, pgjdbc) exercises this
 /// path.
+/// `result_format` carries the per-column wire format the client bound for
+/// results (extended-query path); `None` means all-text (simple-query
+/// protocol, which never negotiates binary). It is forwarded to
+/// `execute_trino_query` so the result schema and DataRow encoding honor it.
 pub(crate) async fn process_query(
     query: &str,
     trino_client: &Arc<TrinoClient>,
     config: &Arc<Config>,
     active_query_id: Option<&ActiveQueryId>,
+    result_format: Option<&Format>,
 ) -> PgWireResult<Vec<Response>> {
     tracing::trace!(query, "Pipeline: enter");
 
     let pieces = split_statements(query);
     if pieces.len() <= 1 {
-        return process_single_statement(query, trino_client, config, active_query_id).await;
+        return process_single_statement(
+            query,
+            trino_client,
+            config,
+            active_query_id,
+            result_format,
+        )
+        .await;
     }
 
     tracing::trace!(count = pieces.len(), "Pipeline: multi-statement input");
     let mut out = Vec::with_capacity(pieces.len());
     for stmt in &pieces {
-        match process_single_statement(stmt, trino_client, config, active_query_id).await {
+        match process_single_statement(stmt, trino_client, config, active_query_id, result_format)
+            .await
+        {
             Ok(mut responses) => out.append(&mut responses),
             // User-visible errors (e.g. a Trino syntax error on statement N
             // of a batch) are converted to a Response::Error so that the
@@ -91,6 +106,7 @@ async fn process_single_statement(
     trino_client: &Arc<TrinoClient>,
     config: &Arc<Config>,
     active_query_id: Option<&ActiveQueryId>,
+    result_format: Option<&Format>,
 ) -> PgWireResult<Vec<Response>> {
     // The query is parsed up to three times: once here (for routing
     // checks), once by the multi-statement splitter in the public
@@ -136,7 +152,7 @@ async fn process_single_statement(
     tracing::debug!(original = query, rewritten = %rewritten, "Rewritten query");
 
     let (schema, row_stream) =
-        execute_trino_query(trino_client, rewritten, active_query_id).await?;
+        execute_trino_query(trino_client, rewritten, active_query_id, result_format).await?;
 
     if schema.is_empty() {
         tracing::trace!("Pipeline: Trino returned no schema — treating as DDL/DML");

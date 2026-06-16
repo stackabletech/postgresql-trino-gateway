@@ -28,12 +28,21 @@ sqlparser = { version = "0.61", features = ["visitor"] }
 # around this same code.
 rustls-pki-types = { version = "1", features = ["std"] }
 rand = "0.10"
+# Used to build typed values for the binary result-wire-format path
+# (`types::encode_cell`). Versions are unified with the impls pgwire's
+# default features pull into `postgres-types` (chrono 0.4, rust_decimal 1.x
+# with `db-postgres`), so the `ToSql`/`ToSqlText` impls apply.
+chrono = "0.4"
+rust_decimal = { version = "1", features = ["db-postgres"] }
 
 [build-dependencies]
 chrono = "0.4"
 
 [dev-dependencies]
-tokio-postgres = "0.7"
+# with-chrono-0_4 lets the test client decode binary timestamps, exercising
+# the binary result path for the customer's timestamp columns end-to-end.
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+chrono = "0.4"
 tempfile = "3"
 rcgen = "0.14"
 

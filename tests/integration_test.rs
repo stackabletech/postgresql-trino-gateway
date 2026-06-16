@@ -983,20 +983,77 @@ async fn test_auth_passthrough_to_trino() {
 // were added, the extended path had zero direct test coverage.
 // ---------------------------------------------------------------------------
 
+/// Documents the remaining boundary of the binary-result-format fix: the
+/// live-data path (`trino_stream`) now honors per-column binary requests, but
+/// the **static catalog/intercept** path (`catalog::build_response`, used for
+/// `pg_type` and friends) is still text-only.
+///
+/// This needs no Trino: `pg_type` is a static intercept whose `typname`
+/// column is VARCHAR and `oid` column is INT4. A binary-requesting client
+/// (tokio-postgres binds `result_format_codes = binary` for every column)
+/// therefore still binary-decodes our text bytes for the catalog path:
+/// - VARCHAR decodes fine — its binary and text wire forms are byte-identical.
+/// - INT4 binary-decoded from ASCII text bytes still fails.
+///
+/// Type-loading drivers (pgjdbc, Npgsql) request *text* for these catalog
+/// queries in practice, so this is not user-visible; wiring binary through the
+/// catalog responders is tracked as follow-up in TODO.md. If that lands, the
+/// `oid` assertion below flips to `is_ok()`.
+#[tokio::test]
+async fn catalog_intercept_path_is_still_text_only() {
+    let addr = start_gateway(test_config()).await;
+    let client = connect(addr).await;
+
+    let text_rows = extract_rows(
+        client
+            .simple_query("SELECT typname, oid FROM pg_type")
+            .await
+            .unwrap(),
+    );
+    assert!(
+        !text_rows.is_empty(),
+        "pg_type static intercept should return rows"
+    );
+
+    // tokio-postgres binds result_format_codes = binary for every column.
+    let rows = client
+        .query("SELECT typname, oid FROM pg_type", &[])
+        .await
+        .unwrap();
+    assert!(!rows.is_empty(), "binary-bound query should return rows");
+
+    // VARCHAR: binary == text on the wire, so this decodes correctly.
+    let typname: Result<&str, _> = rows[0].try_get("typname");
+    assert!(
+        typname.is_ok(),
+        "varchar must decode even under a binary request (binary==text on \
+         the wire); got {:?}",
+        typname.err()
+    );
+
+    // INT4 from the still-text-only catalog path: binary-decoding the text
+    // bytes fails. (The live-data path is covered by the unit tests in
+    // `types.rs` and the Trino-gated extended-protocol tests below.)
+    let oid: Result<i32, _> = rows[0].try_get("oid");
+    assert!(
+        oid.is_err(),
+        "catalog path is text-only: int4 binary-decode of text bytes should \
+         fail. Got Ok({:?}) — if catalog responders gained binary support, \
+         flip this to is_ok().",
+        oid.ok()
+    );
+}
+
 /// Prepare-and-execute drives Parse/Bind/Describe/Execute end-to-end. The
 /// portal-cache path in query_extended is exercised here: do_describe_portal
 /// runs the query and stashes the response, do_query takes the stash.
 // The three tests below exercise the extended-protocol path with typed
 // column extraction (`rows[0].get::<_, i32>(0)`). tokio-postgres' Bind
-// hardcodes `result_format_codes = Some(1)` (binary for every column);
-// our gateway emits text-only DataRow. pgwire 0.39 stores
-// `portal.result_column_format` but its default encode path doesn't
-// honor it, so a server-side fix would require either an upstream
-// change or our own re-encoding wrapper. Documented as a known
-// limitation in README.md > "Wire format". Run with
-// `cargo test -- --ignored` once binary support lands.
+// hardcodes `result_format_codes = Some(1)` (binary for every column).
+// The gateway now honors binary result formats on the live-data path
+// (`types::encode_cell` + `trino_stream::build_pg_schema`), so these pass.
+// They need a real Trino (auto-skip when TRINO_HOST is unset).
 #[tokio::test]
-#[ignore = "binary wire format not implemented; tokio-postgres' Bind requests binary"]
 async fn test_extended_prepared_select() {
     let config = match trino_config() {
         Some(c) => c,
@@ -1019,7 +1076,6 @@ async fn test_extended_prepared_select() {
 /// the first Describe is consumed, so the second Execute re-runs through
 /// the pipeline. Checks the cache-miss fallback path.
 #[tokio::test]
-#[ignore = "binary wire format not implemented; tokio-postgres' Bind requests binary"]
 async fn test_extended_re_execute() {
     let config = match trino_config() {
         Some(c) => c,
@@ -1044,7 +1100,6 @@ async fn test_extended_re_execute() {
 /// without colliding on the unnamed portal or interfering with each other's
 /// active_query_id slot.
 #[tokio::test]
-#[ignore = "binary wire format not implemented; tokio-postgres' Bind requests binary"]
 async fn test_extended_two_prepared_statements() {
     let config = match trino_config() {
         Some(c) => c,
@@ -1064,6 +1119,51 @@ async fn test_extended_two_prepared_statements() {
 
     assert_eq!(rows_a[0].get::<_, i32>(0), 1);
     assert_eq!(rows_b[0].get::<_, i32>(0), 2);
+}
+
+/// End-to-end binary decode of the exact column types from the customer's
+/// failing Power BI preview: bigint, real, double, and timestamp (plus bool).
+/// tokio-postgres binds `result_format_codes = binary` for every column, so
+/// each `get::<T>()` here forces the gateway to emit PostgreSQL binary — the
+/// behaviour that was broken (text-only) and is the subject of the fix.
+/// Regression guard for the reported "ERROR on Float/Integer/Timestamp,
+/// strings fine" symptom. Trino-gated.
+#[tokio::test]
+async fn test_extended_binary_customer_column_types() {
+    let config = match trino_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping: TRINO_HOST not set");
+            return;
+        }
+    };
+    let addr = start_gateway(config).await;
+    let client = connect(addr).await;
+
+    let row = client
+        .query_one(
+            "SELECT CAST(42 AS bigint) AS a, \
+                    CAST(1.5 AS real) AS b, \
+                    CAST(2.5 AS double) AS c, \
+                    TIMESTAMP '2026-06-01 10:30:00' AS d, \
+                    true AS e",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(row.get::<_, i64>("a"), 42);
+    assert_eq!(row.get::<_, f32>("b"), 1.5);
+    assert_eq!(row.get::<_, f64>("c"), 2.5);
+    let ts: chrono::NaiveDateTime = row.get("d");
+    assert_eq!(
+        ts,
+        chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
+            .unwrap()
+            .and_hms_opt(10, 30, 0)
+            .unwrap()
+    );
+    assert!(row.get::<_, bool>("e"));
 }
 
 /// Catalog-emulation queries reach Trino through the extended path too —
