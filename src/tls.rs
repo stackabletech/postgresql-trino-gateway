@@ -21,8 +21,6 @@
 //! provider has been installed and removes the ordering coupling between
 //! `build_acceptor` and any global init step.
 
-use std::fs::File;
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -30,6 +28,7 @@ use anyhow::{Context, Result, anyhow};
 use pgwire::tokio::TlsAcceptor;
 use pgwire::tokio::tokio_rustls::rustls::ServerConfig;
 use pgwire::tokio::tokio_rustls::rustls::crypto::aws_lc_rs;
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 /// Build a `TlsAcceptor` from PEM-encoded certificate chain and private key
@@ -56,11 +55,9 @@ pub fn build_acceptor(cert_path: &Path, key_path: &Path) -> Result<TlsAcceptor> 
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let file = File::open(path)
-        .with_context(|| format!("opening TLS certificate file {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
-        .collect::<std::io::Result<Vec<_>>>()
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_file_iter(path)
+        .with_context(|| format!("opening TLS certificate file {}", path.display()))?
+        .collect::<Result<Vec<_>, _>>()
         .with_context(|| format!("reading TLS certificate PEM {}", path.display()))?;
     if certs.is_empty() {
         return Err(anyhow!("no PEM certificates found in {}", path.display()));
@@ -69,13 +66,8 @@ fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
 }
 
 fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let file =
-        File::open(path).with_context(|| format!("opening TLS key file {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let key = rustls_pemfile::private_key(&mut reader)
-        .with_context(|| format!("reading TLS key PEM {}", path.display()))?
-        .ok_or_else(|| anyhow!("no PEM private key found in {}", path.display()))?;
-    Ok(key)
+    PrivateKeyDer::from_pem_file(path)
+        .with_context(|| format!("reading TLS private key PEM {}", path.display()))
 }
 
 #[cfg(test)]
