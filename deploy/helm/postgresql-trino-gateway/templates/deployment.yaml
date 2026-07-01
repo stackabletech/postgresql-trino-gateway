@@ -70,10 +70,10 @@ spec:
             {{- if .Values.auth.enabled }}
             - --auth
             {{- end }}
-            {{- if and (not .Values.auth.enabled) .Values.auth.allowInsecureListener }}
+            {{- if not .Values.auth.enabled }}
             - --allow-insecure-listener
             {{- end }}
-            {{- if eq (include "postgresql-trino-gateway.tlsEnabled" .) "true" }}
+            {{- if include "postgresql-trino-gateway.tlsEnabled" . }}
             - --tls-cert=/stackable/listener-tls/tls.crt
             - --tls-key=/stackable/listener-tls/tls.key
             {{- end }}
@@ -96,13 +96,13 @@ spec:
           {{- end }}
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
-          {{- if eq (include "postgresql-trino-gateway.tlsEnabled" .) "true" }}
+          {{- if include "postgresql-trino-gateway.tlsEnabled" . }}
           volumeMounts:
             - name: listener-tls
               mountPath: /stackable/listener-tls
               readOnly: true
           {{- end }}
-      {{- if eq (include "postgresql-trino-gateway.tlsEnabled" .) "true" }}
+      {{- if include "postgresql-trino-gateway.tlsEnabled" . }}
       volumes:
         - name: listener-tls
           {{- if .Values.tls.secretClass }}

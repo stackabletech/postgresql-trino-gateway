@@ -62,6 +62,17 @@ expose the gateway outside the cluster:
 3. An L4-aware ingress (e.g. nginx with `tcp-services`) or a
    `Gateway` resource using a TCPRoute.
 
+## Scaling
+
+`replicaCount` defaults to `1` and should not be raised without solving
+sticky routing first. The cancel registry and other per-connection
+state are in-memory per pod; a PG `CancelRequest` must land on the same
+replica as the original connection to work, and the plain `ClusterIP`
+Service this chart creates does not guarantee that (no
+`sessionAffinity`, round-robin by default). Running multiple replicas
+today means query cancellation silently no-ops for connections routed
+to the wrong pod.
+
 ## Probes
 
 Both readiness and liveness use TCP socket probes against the listening

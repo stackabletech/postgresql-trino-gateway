@@ -1,6 +1,11 @@
 ---
 # Default values for postgresql-trino-gateway.
 
+# The cancel registry and per-connection state are in-memory (see the
+# project README). Running more than one replica requires sticky-by-
+# connection routing AND the PG CancelRequest landing on the same
+# replica as the original connection — the Service alone does not
+# guarantee this. Do not raise this without also solving that.
 replicaCount: 1
 
 image:

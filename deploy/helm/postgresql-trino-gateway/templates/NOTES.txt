@@ -1,3 +1,4 @@
+{{- $tlsEnabled := include "postgresql-trino-gateway.tlsEnabled" . }}
 {{ .Chart.Name }} {{ .Chart.AppVersion }} installed as release {{ .Release.Name }}.
 
 Gateway is listening on port {{ .Values.service.port }}, forwarding to:
@@ -8,7 +9,7 @@ Gateway is listening on port {{ .Values.service.port }}, forwarding to:
 Auth posture:
 {{- if .Values.auth.enabled }}
   - Cleartext password challenge to PG clients, forwarded to Trino as Basic auth.
-  {{- if eq (include "postgresql-trino-gateway.tlsEnabled" .) "true" }}
+  {{- if $tlsEnabled }}
   - Listener TLS: enabled (plaintext clients refused at handshake).
   {{- else }}
   - Listener TLS: NOT configured. The gateway will refuse to start.
@@ -20,7 +21,7 @@ Auth posture:
 
 Connect from inside the cluster:
 
-  psql -h {{ include "postgresql-trino-gateway.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local \
+  {{ if $tlsEnabled }}PGSSLMODE=require {{ end }}psql -h {{ include "postgresql-trino-gateway.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local \
        -p {{ .Values.service.port }} \
        -U {{ .Values.trino.user }} \
        -d {{ .Values.trino.catalog }}
@@ -28,7 +29,7 @@ Connect from inside the cluster:
 Connect from outside (port-forward):
 
   kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "postgresql-trino-gateway.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
-  psql -h 127.0.0.1 -p {{ .Values.service.port }} -U {{ .Values.trino.user }} -d {{ .Values.trino.catalog }}
+  {{ if $tlsEnabled }}PGSSLMODE=require {{ end }}psql -h 127.0.0.1 -p {{ .Values.service.port }} -U {{ .Values.trino.user }} -d {{ .Values.trino.catalog }}
 
 For Power BI Report Server in DirectQuery mode, point the PostgreSQL
 connector at the Service host/port above (or expose via an L4
