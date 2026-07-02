@@ -3,8 +3,8 @@ apiVersion: v2
 name: postgresql-trino-gateway
 description: PostgreSQL wire-protocol gateway in front of Trino, enabling Power BI DirectQuery and other PG-only clients.
 type: application
-version: 0.0.0-dev
-appVersion: "0.0.0-dev"
+version: 0.1.0
+appVersion: "0.1.0"
 home: https://stackable.tech
 sources:
   - https://github.com/stackabletech/postgresql-trino-gateway
