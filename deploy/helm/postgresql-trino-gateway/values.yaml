@@ -28,6 +28,15 @@ serviceAccount:
 podAnnotations: {}
 podLabels: {}
 
+# OpenShift assigns a per-namespace UID/GID/fsGroup range via its SCCs
+# (e.g. restricted-v2) and rejects pods that request values outside it.
+# When enabled=true the chart omits runAsUser, runAsGroup and fsGroup from
+# the pod and container securityContext so OpenShift injects them from the
+# namespace range. The image (/stackable is group-0 owned with g=u perms,
+# readOnlyRootFilesystem is set) already runs as an arbitrary UID+GID 0.
+openshift:
+  enabled: false
+
 podSecurityContext:
   runAsNonRoot: true
   runAsUser: 782252253

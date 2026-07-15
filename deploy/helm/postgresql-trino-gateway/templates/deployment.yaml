@@ -43,11 +43,21 @@ spec:
       serviceAccountName: {{ include "postgresql-trino-gateway.serviceAccountName" . }}
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       securityContext:
-        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+        {{- $podSecurityContext := deepCopy .Values.podSecurityContext }}
+        {{- if .Values.openshift.enabled }}
+        {{- $_ := unset $podSecurityContext "runAsUser" }}
+        {{- $_ := unset $podSecurityContext "runAsGroup" }}
+        {{- $_ := unset $podSecurityContext "fsGroup" }}
+        {{- end }}
+        {{- toYaml $podSecurityContext | nindent 8 }}
       containers:
         - name: gateway
           securityContext:
-            {{- toYaml .Values.securityContext | nindent 12 }}
+            {{- $securityContext := deepCopy .Values.securityContext }}
+            {{- if .Values.openshift.enabled }}
+            {{- $_ := unset $securityContext "runAsUser" }}
+            {{- end }}
+            {{- toYaml $securityContext | nindent 12 }}
           image: {{ include "postgresql-trino-gateway.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
