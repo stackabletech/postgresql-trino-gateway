@@ -51,6 +51,18 @@ not configured here.
 and `trino.ssl=false` (cleartext password forwarded to Trino over plain
 HTTP). Use only with a loopback or otherwise-trusted Trino.
 
+## OpenShift
+
+By default the chart pins `runAsUser`, `runAsGroup` and `fsGroup` to the
+IDs baked into the image (the `stackable` user). OpenShift's SCCs (e.g.
+`restricted-v2`) instead assign a UID/fsGroup from a per-namespace range
+and reject any pod requesting IDs outside it, so the defaults fail
+admission with `... is not an allowed group` / `must be in the ranges`.
+
+Set `openshift.enabled=true` to omit `runAsUser`, `runAsGroup` and
+`fsGroup` from the pod and container security contexts, letting the SCC
+inject them.
+
 ## Connectivity
 
 The Service is `ClusterIP` on TCP/5432 by default. PG protocol is not
@@ -100,6 +112,8 @@ See `values.yaml` for the full list. Notable groups:
 - `livenessProbe`, `readinessProbe`, `startupProbe` — TCP socket probes.
 - `podSecurityContext`, `securityContext` — non-root, read-only root FS,
   drop ALL capabilities.
+- `openshift.enabled` — drop hardcoded UID/GID/fsGroup so OpenShift SCCs
+  assign them (see [OpenShift](#openshift)).
 - `maxConnections` — concurrent connection cap.
 - `logLevel` — `RUST_LOG` value (e.g. `postgresql_trino_gateway=debug`).
 
