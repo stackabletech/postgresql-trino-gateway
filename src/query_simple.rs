@@ -26,6 +26,10 @@ impl SimpleQueryHandler for GatewayQueryHandler {
     {
         tracing::debug!(query, "Simple query received");
 
+        // Captured before borrowing session state, so the `pg_stat_ssl`
+        // intercept can report this connection's real TLS state.
+        let client_is_secure = client.is_secure();
+
         let conn_state = client
             .session_extensions()
             .get::<ConnectionState>()
@@ -39,6 +43,7 @@ impl SimpleQueryHandler for GatewayQueryHandler {
             &conn_state.config,
             Some(&conn_state.active_query_id),
             None,
+            client_is_secure,
         )
         .await;
         match &result {

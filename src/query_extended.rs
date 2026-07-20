@@ -91,6 +91,8 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         let query = &portal.statement.statement;
         tracing::debug!(query, "Extended query execute");
 
+        let client_is_secure = client.is_secure();
+
         let conn_state = client
             .session_extensions()
             .get::<ConnectionState>()
@@ -118,6 +120,7 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
             &conn_state.config,
             Some(&conn_state.active_query_id),
             Some(&portal.result_column_format),
+            client_is_secure,
         )
         .await?;
         let response = responses
@@ -182,6 +185,8 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
             return Ok(DescribeStatementResponse::no_data());
         }
 
+        let client_is_secure = client.is_secure();
+
         let conn_state = client
             .session_extensions()
             .get::<ConnectionState>()
@@ -201,6 +206,7 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
             &conn_state.config,
             Some(&conn_state.active_query_id),
             None,
+            client_is_secure,
         )
         .await?;
         let response = responses
@@ -230,6 +236,8 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
         let query = &portal.statement.statement;
         tracing::debug!(query, "Extended query describe portal");
 
+        let client_is_secure = client.is_secure();
+
         let conn_state = client
             .session_extensions()
             .get::<ConnectionState>()
@@ -241,6 +249,7 @@ impl ExtendedQueryHandler for GatewayExtendedQueryHandler {
             &conn_state.config,
             Some(&conn_state.active_query_id),
             Some(&portal.result_column_format),
+            client_is_secure,
         )
         .await?;
         let response = responses

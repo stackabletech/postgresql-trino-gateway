@@ -24,6 +24,23 @@ fn single_text_response(column_name: &str, value: &str) -> PgWireResult<Vec<Resp
     ))])
 }
 
+/// Build a single-column, single-row BOOL text response (`t`/`f` on the wire).
+/// Used for the `pg_stat_ssl` probe, whose `ssl` column is a boolean; a
+/// VARCHAR response would carry the wrong type oid in the RowDescription and
+/// Npgsql decodes the column strictly by that oid.
+fn single_bool_response(column_name: &str, value: bool) -> PgWireResult<Vec<Response>> {
+    let fields = Arc::new(vec![text_field(column_name, Type::BOOL)]);
+
+    let mut encoder = DataRowEncoder::new(Arc::clone(&fields));
+    encoder.encode_field(&value)?;
+    let row = encoder.take_row();
+
+    Ok(vec![Response::Query(QueryResponse::new(
+        fields,
+        stream::iter(vec![Ok(row)]),
+    ))])
+}
+
 /// If the query can be answered locally instead of forwarded to Trino,
 /// build the response and return it. Returns `None` for queries that
 /// should pass through to Trino.
@@ -37,11 +54,15 @@ fn single_text_response(column_name: &str, value: &str) -> PgWireResult<Vec<Resp
 /// `calls_function`) handle the cases where prefix matching would
 /// misroute a user query that *contains* a catalog name as a literal or
 /// column reference.
+///
+/// `client_is_secure` is the TLS state of the PG client connection, used to
+/// answer the `pg_stat_ssl` probe truthfully (see below).
 pub fn try_intercept(
     query: &str,
     parsed_query: &ParsedQuery,
     catalog: &str,
     schema: &str,
+    client_is_secure: bool,
 ) -> Option<PgWireResult<Vec<Response>>> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -93,6 +114,17 @@ pub fn try_intercept(
     if let Some(resp) = intercept_server_functions(parsed_query, catalog, schema) {
         tracing::trace!(query = trimmed, "Intercept: server function");
         return Some(resp);
+    }
+
+    // Npgsql (Power BI) and pgjdbc probe the connection's encryption state
+    // right after connecting with `SELECT ssl FROM pg_stat_ssl WHERE pid =
+    // pg_backend_pid()`. Trino has no `pg_stat_ssl`, so forwarding it aborts
+    // the session before the client runs a single user query. Answer locally
+    // with the real TLS state of this connection; the `WHERE pid = ...` clause
+    // is moot because a backend only ever sees its own row in pg_stat_ssl.
+    if parsed_query.references_table("pg_stat_ssl") {
+        tracing::trace!(query = trimmed, "Intercept: pg_stat_ssl");
+        return Some(single_bool_response("ssl", client_is_secure));
     }
 
     if let Some(resp) = crate::catalog::handle_catalog_query(parsed_query) {
@@ -188,7 +220,7 @@ mod tests {
     fn assert_intercepted(query: &str) {
         let parsed_query = ParsedQuery::new(query);
         assert!(
-            try_intercept(query, &parsed_query, "test_catalog", "test_schema").is_some(),
+            try_intercept(query, &parsed_query, "test_catalog", "test_schema", false).is_some(),
             "expected query to be intercepted: {query}"
         );
     }
@@ -196,7 +228,7 @@ mod tests {
     fn assert_not_intercepted(query: &str) {
         let parsed_query = ParsedQuery::new(query);
         assert!(
-            try_intercept(query, &parsed_query, "test_catalog", "test_schema").is_none(),
+            try_intercept(query, &parsed_query, "test_catalog", "test_schema", false).is_none(),
             "expected query to NOT be intercepted: {query}"
         );
     }
@@ -246,7 +278,7 @@ mod tests {
 
         for &(query, expected) in cases {
             let parsed_query = ParsedQuery::new(query);
-            let result = try_intercept(query, &parsed_query, "test_catalog", "test_schema")
+            let result = try_intercept(query, &parsed_query, "test_catalog", "test_schema", false)
                 .unwrap_or_else(|| panic!("SHOW not intercepted: {query}"));
             assert!(result.is_ok(), "SHOW returned error for: {query}");
 
@@ -278,6 +310,45 @@ mod tests {
         assert_intercepted("SELECT pg_is_in_recovery()");
         assert_intercepted("SELECT current_setting('server_version_num')");
         assert_intercepted("SELECT current_setting('server_version')");
+    }
+
+    /// The Npgsql/pgjdbc SSL probe is answered locally instead of forwarded
+    /// to Trino (which has no `pg_stat_ssl` and would abort the connection).
+    #[test]
+    fn pg_stat_ssl_probe_intercepted() {
+        assert_intercepted("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()");
+        assert_intercepted("select ssl from pg_stat_ssl");
+    }
+
+    /// The `ssl` column reports the connection's real TLS state and is typed
+    /// BOOL (not VARCHAR) so the RowDescription oid matches what the driver
+    /// decodes.
+    #[test]
+    fn pg_stat_ssl_reports_tls_state_as_bool() {
+        let query = "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()";
+        let parsed_query = ParsedQuery::new(query);
+
+        for is_secure in [true, false] {
+            let resp = try_intercept(query, &parsed_query, "cat", "sch", is_secure)
+                .expect("pg_stat_ssl must be intercepted")
+                .expect("intercept must not error");
+            assert_eq!(resp.len(), 1);
+            match &resp[0] {
+                Response::Query(qr) => {
+                    assert_eq!(qr.row_schema.len(), 1);
+                    assert_eq!(qr.row_schema[0].name(), "ssl");
+                    assert_eq!(qr.row_schema[0].datatype(), &Type::BOOL);
+                }
+                other => panic!("expected Query response, got: {other:?}"),
+            }
+        }
+    }
+
+    /// Regression: a user table literally named `pg_stat_ssl` in a literal
+    /// must not trip the probe intercept.
+    #[test]
+    fn pg_stat_ssl_in_literal_not_intercepted() {
+        assert_not_intercepted("SELECT 'pg_stat_ssl' AS sentinel");
     }
 
     #[test]
