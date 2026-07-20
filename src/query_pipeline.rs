@@ -49,6 +49,7 @@ pub(crate) async fn process_query(
     config: &Arc<Config>,
     active_query_id: Option<&ActiveQueryId>,
     result_format: Option<&Format>,
+    client_is_secure: bool,
 ) -> PgWireResult<Vec<Response>> {
     tracing::trace!(query, "Pipeline: enter");
 
@@ -60,6 +61,7 @@ pub(crate) async fn process_query(
             config,
             active_query_id,
             result_format,
+            client_is_secure,
         )
         .await;
     }
@@ -67,8 +69,15 @@ pub(crate) async fn process_query(
     tracing::trace!(count = pieces.len(), "Pipeline: multi-statement input");
     let mut out = Vec::with_capacity(pieces.len());
     for stmt in &pieces {
-        match process_single_statement(stmt, trino_client, config, active_query_id, result_format)
-            .await
+        match process_single_statement(
+            stmt,
+            trino_client,
+            config,
+            active_query_id,
+            result_format,
+            client_is_secure,
+        )
+        .await
         {
             Ok(mut responses) => out.append(&mut responses),
             // User-visible errors (e.g. a Trino syntax error on statement N
@@ -107,6 +116,7 @@ async fn process_single_statement(
     config: &Arc<Config>,
     active_query_id: Option<&ActiveQueryId>,
     result_format: Option<&Format>,
+    client_is_secure: bool,
 ) -> PgWireResult<Vec<Response>> {
     // The query is parsed up to three times: once here (for routing
     // checks), once by the multi-statement splitter in the public
@@ -122,6 +132,7 @@ async fn process_single_statement(
         &parsed_query,
         &config.trino_catalog,
         &config.trino_schema,
+        client_is_secure,
     ) {
         tracing::trace!("Pipeline: static intercept matched");
         return result;
