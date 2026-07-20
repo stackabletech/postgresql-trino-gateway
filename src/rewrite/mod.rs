@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: OSL-3.0
 mod casts;
 mod functions;
+mod limit_offset;
 mod predicates;
 
 use sqlparser::ast::VisitMut;
@@ -22,6 +23,8 @@ use sqlparser::parser::Parser;
 /// - PostgreSQL type names are normalized to Trino equivalents
 /// - `ILIKE` becomes `lower(x) LIKE lower(pattern)`
 /// - PostgreSQL function names are mapped to Trino equivalents
+/// - `LIMIT n OFFSET m` is reordered into Trino order
+///   (`OFFSET m FETCH FIRST n ROWS ONLY`)
 ///
 /// If parsing fails (e.g. for `SET`, `SHOW`, `DISCARD` commands), the original
 /// SQL is returned unchanged.
@@ -57,9 +60,11 @@ pub fn rewrite_sql(sql: &str) -> String {
     let mut cast_rewriter = casts::CastRewriter;
     let mut ilike_rewriter = predicates::ILikeRewriter;
     let mut fn_renamer = functions::FunctionRenamer;
+    let mut limit_offset_rewriter = limit_offset::LimitOffsetRewriter;
     let _ = stmt.visit(&mut cast_rewriter);
     let _ = stmt.visit(&mut ilike_rewriter);
     let _ = stmt.visit(&mut fn_renamer);
+    let _ = stmt.visit(&mut limit_offset_rewriter);
 
     stmt.to_string()
 }
@@ -133,6 +138,36 @@ mod tests {
             must_contain: &["SELECT", "FROM"],
             must_not_contain: &[],
         },
+        Case {
+            name: "LIMIT n OFFSET m → OFFSET m FETCH FIRST n (no bare LIMIT)",
+            input: "SELECT name FROM t ORDER BY name LIMIT 2 OFFSET 1",
+            must_contain: &["OFFSET 1", "FETCH FIRST 2"],
+            must_not_contain: &["LIMIT"],
+        },
+        Case {
+            name: "LIMIT only is left unchanged",
+            input: "SELECT name FROM t LIMIT 5",
+            must_contain: &["LIMIT 5"],
+            must_not_contain: &["FETCH", "OFFSET"],
+        },
+        Case {
+            name: "OFFSET only is left unchanged",
+            input: "SELECT name FROM t OFFSET 3",
+            must_contain: &["OFFSET 3"],
+            must_not_contain: &["FETCH", "LIMIT"],
+        },
+        Case {
+            name: "LIMIT ALL OFFSET m → bare OFFSET (ALL dropped, no FETCH)",
+            input: "SELECT name FROM t LIMIT ALL OFFSET 4",
+            must_contain: &["OFFSET 4"],
+            must_not_contain: &["FETCH", "LIMIT", "ALL"],
+        },
+        Case {
+            name: "subquery LIMIT+OFFSET is reordered too",
+            input: "SELECT * FROM (SELECT name FROM t ORDER BY name LIMIT 2 OFFSET 1) x",
+            must_contain: &["OFFSET 1", "FETCH FIRST 2"],
+            must_not_contain: &["LIMIT"],
+        },
     ];
 
     #[test]
@@ -160,6 +195,20 @@ mod tests {
     fn unparseable_sql_passes_through() {
         let input = "SET extra_float_digits = 3";
         assert_eq!(rewrite_sql(input), input);
+    }
+
+    /// The reordered clause must place `OFFSET` before the row-limiting
+    /// `FETCH` — the whole point of the rewrite, which the substring-based
+    /// `Case` table cannot assert on its own.
+    #[test]
+    fn limit_offset_emits_offset_before_fetch() {
+        let result = rewrite_sql("SELECT name FROM t ORDER BY name LIMIT 2 OFFSET 1");
+        let offset_at = result.find("OFFSET").expect("OFFSET present");
+        let fetch_at = result.find("FETCH").expect("FETCH present");
+        assert!(
+            offset_at < fetch_at,
+            "expected OFFSET before FETCH in: {result}"
+        );
     }
 
     #[test]

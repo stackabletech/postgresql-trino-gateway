@@ -437,6 +437,22 @@ trino_tests!(
             "SELECT name FROM nation ORDER BY nationkey OFFSET 5 ROWS FETCH FIRST 3 ROWS ONLY",
             Check::Rows { min_rows: 3 }
         ),
+        // PostgreSQL-order `LIMIT n OFFSET m` — Trino rejects it verbatim; the
+        // rewriter reorders it into `OFFSET m FETCH FIRST n ROWS ONLY`. nation
+        // ordered by nationkey is ALGERIA(0), ARGENTINA(1), ...; offset 1
+        // limit 1 must yield ARGENTINA.
+        (
+            "pg-order limit offset",
+            "SELECT name FROM nation ORDER BY nationkey LIMIT 1 OFFSET 1",
+            Check::Value { value: "ARGENTINA" }
+        ),
+        // Same rewrite must apply inside a subquery (inner → ARGENTINA, BRAZIL;
+        // outer takes the first alphabetically).
+        (
+            "pg-order limit offset in subquery",
+            "SELECT name FROM (SELECT name FROM nation ORDER BY nationkey LIMIT 2 OFFSET 1) t ORDER BY name LIMIT 1",
+            Check::Value { value: "ARGENTINA" }
+        ),
     ]
 );
 
