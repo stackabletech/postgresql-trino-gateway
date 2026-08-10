@@ -33,14 +33,23 @@ rand = "0.10"
 # default features pull into `postgres-types` (chrono 0.4, rust_decimal 1.x
 # with `db-postgres`), so the `ToSql`/`ToSqlText` impls apply.
 chrono = "0.4"
+# Resolves the named zones Trino renders for `timestamp with time zone`
+# (`... Europe/Berlin`) to an instant.
+chrono-tz = "0.10"
 rust_decimal = { version = "1", features = ["db-postgres"] }
+# `timetz` has no chrono equivalent, so `types::TimeTz` implements `ToSql`
+# itself. Must stay on the 0.2 line pgwire pulls in, otherwise the impl is for
+# a different trait than pgwire's encoder requires.
+postgres-types = { version = "0.2", features = ["with-chrono-0_4"] }
+# `BytesMut` for those hand-written `ToSql`/`ToSqlText` impls.
+bytes = "1"
 
 [build-dependencies]
 chrono = "0.4"
 
 [dev-dependencies]
-# with-chrono-0_4 lets the test client decode binary timestamps, exercising
-# the binary result path for the customer's timestamp columns end-to-end.
+# with-chrono-0_4 lets the test client decode binary date/time values, which
+# exercises the binary result path end-to-end.
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 chrono = "0.4"
 tempfile = "3"

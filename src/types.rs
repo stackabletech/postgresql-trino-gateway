@@ -1,9 +1,17 @@
 // SPDX-FileCopyrightText: 2026 Stackable GmbH
 // SPDX-License-Identifier: OSL-3.0
-use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
+use std::borrow::Cow;
+use std::error::Error;
+
+use bytes::{BufMut, BytesMut};
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Timelike, Utc};
+use chrono_tz::Tz;
 use pgwire::api::Type;
 use pgwire::api::results::{DataRowEncoder, FieldFormat};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::types::ToSqlText;
+use pgwire::types::format::FormatOptions;
+use postgres_types::{IsNull, ToSql, to_sql_checked};
 use rust_decimal::Decimal;
 use serde_json::Value;
 
@@ -18,27 +26,7 @@ pub fn trino_type_to_pg(trino_type: &str) -> Type {
         return scalar_to_array(&trino_type_to_pg(inner));
     }
 
-    // Match multi-word types before stripping parameters.
-    if normalized.starts_with("time with time zone") {
-        return Type::TIMETZ;
-    }
-    if normalized.starts_with("timestamp with time zone") {
-        return Type::TIMESTAMPTZ;
-    }
-    if normalized.starts_with("interval year to month") {
-        return Type::INTERVAL;
-    }
-    if normalized.starts_with("interval day to second") {
-        return Type::INTERVAL;
-    }
-
-    // Strip parameters for parametric types like varchar(100), decimal(10,2)
-    let base = match normalized.find('(') {
-        Some(idx) => normalized[..idx].trim(),
-        None => normalized.as_str(),
-    };
-
-    match base {
+    match strip_type_params(&normalized).as_str() {
         "boolean" => Type::BOOL,
         "tinyint" | "smallint" => Type::INT2,
         "integer" => Type::INT4,
@@ -51,13 +39,34 @@ pub fn trino_type_to_pg(trino_type: &str) -> Type {
         "varbinary" => Type::BYTEA,
         "date" => Type::DATE,
         "time" => Type::TIME,
+        "time with time zone" => Type::TIMETZ,
         "timestamp" => Type::TIMESTAMP,
-        "interval" => Type::INTERVAL,
+        "timestamp with time zone" => Type::TIMESTAMPTZ,
+        "interval" | "interval year to month" | "interval day to second" => Type::INTERVAL,
         "json" => Type::JSONB,
         "uuid" => Type::UUID,
         "ipaddress" => Type::INET,
         "map" | "row" => Type::JSONB,
         _ => Type::TEXT,
+    }
+}
+
+/// Remove a type's parenthesised parameters, wherever they sit in the name.
+///
+/// Trino spells the precision *inside* the type name (`timestamp(6) with time
+/// zone`), so cutting at the first `(` and dropping the remainder would lose
+/// the ` with time zone` suffix. Removing the span from the first `(` to the
+/// last `)` keeps the full name and collapses nested parameters
+/// (`map(varchar, array(integer))`) in one pass.
+fn strip_type_params(normalized: &str) -> String {
+    match (normalized.find('('), normalized.rfind(')')) {
+        (Some(open), Some(close)) if close > open => {
+            let mut base = String::with_capacity(normalized.len());
+            base.push_str(&normalized[..open]);
+            base.push_str(&normalized[close + 1..]);
+            base.trim().to_owned()
+        }
+        _ => normalized.trim().to_owned(),
     }
 }
 
@@ -98,9 +107,9 @@ fn scalar_to_array(scalar: &Type) -> Type {
 /// For integer target types we force integer form via `as_i64`/`as_u64` so the
 /// wire value always matches the declared column type.
 ///
-/// All values are emitted in the PostgreSQL **text** wire format. The
-/// gateway does not implement the binary wire format; see the
-/// "Wire format" section in `README.md` for why.
+/// All values are emitted in the PostgreSQL **text** wire format, rendered
+/// verbatim. Types whose Trino rendering differs from PostgreSQL's are
+/// reshaped by `text_value` before they reach here.
 pub fn encode_value(value: &Value, trino_type: &str) -> Option<String> {
     let base = base_type(trino_type);
     match value {
@@ -178,10 +187,10 @@ fn encode_number(n: &serde_json::Number, base: &str) -> String {
 ///
 /// Binary encoding is implemented for the scalar types that binary-requesting
 /// drivers (Power BI's Npgsql, Tableau/pgjdbc, tokio-postgres) actually ask
-/// for: bool, the integer and floating types, numeric, date / time /
-/// timestamp (without time zone), and the string family (whose binary and
-/// text wire forms are identical). Any *other* type requested in binary fails
-/// closed with SQLSTATE 0A000 rather than emitting bytes the client would
+/// for: bool, the integer and floating types, numeric, date, time and
+/// timestamp (with and without time zone), and the string family (whose binary
+/// and text wire forms are identical). Any *other* type requested in binary
+/// fails closed with SQLSTATE 0A000 rather than emitting bytes the client would
 /// misread — we cannot silently fall back to text because the client decodes
 /// strictly per the format it bound. See TODO.md "Binary result-format".
 pub fn encode_cell(
@@ -196,9 +205,35 @@ pub fn encode_cell(
         return encoder.encode_field(&None::<&str>);
     }
     match format {
-        FieldFormat::Text => encoder.encode_field(&encode_value(value, trino_type)),
+        FieldFormat::Text => encoder.encode_field(&text_value(value, pg_type, trino_type)),
         FieldFormat::Binary => encode_binary_cell(encoder, value, pg_type, trino_type),
     }
+}
+
+/// Render a non-NULL value for the PostgreSQL **text** wire format.
+///
+/// Trino's rendering matches PostgreSQL's for every type except the two
+/// time-zone-aware ones: Trino writes a named zone or a full offset
+/// (`2026-06-01 10:30:00.000000 Europe/Berlin`), PostgreSQL the session zone
+/// with a compact one (`2026-06-01 08:30:00+00`). Strict client parsers, Npgsql
+/// among them, reject the Trino spelling.
+///
+/// Unparseable values pass through unchanged. Unlike binary, a text value
+/// cannot be *misread* — the client either accepts the bytes or rejects them
+/// itself — so failing the result set here would only break lenient clients
+/// that work today.
+fn text_value(value: &Value, pg_type: &Type, trino_type: &str) -> Option<String> {
+    if *pg_type == Type::TIMESTAMPTZ
+        && let Some(dt) = value.as_str().and_then(parse_trino_timestamptz)
+    {
+        return Some(render_timestamptz_text(dt));
+    }
+    if *pg_type == Type::TIMETZ
+        && let Some(time) = value.as_str().and_then(parse_trino_timetz)
+    {
+        return Some(time.to_pg_text());
+    }
+    encode_value(value, trino_type)
 }
 
 /// Binary-encode a non-NULL value for the column's PostgreSQL type. See
@@ -230,10 +265,14 @@ fn encode_binary_cell(
         encoder.encode_field(&json_to_decimal(value, trino_type)?)
     } else if *t == Type::TIMESTAMP {
         encoder.encode_field(&json_to_timestamp(value, trino_type)?)
+    } else if *t == Type::TIMESTAMPTZ {
+        encoder.encode_field(&json_to_timestamptz(value, trino_type)?)
     } else if *t == Type::DATE {
         encoder.encode_field(&json_to_date(value, trino_type)?)
     } else if *t == Type::TIME {
         encoder.encode_field(&json_to_time(value, trino_type)?)
+    } else if *t == Type::TIMETZ {
+        encoder.encode_field(&json_to_timetz(value, trino_type)?)
     } else if *t == Type::VARCHAR
         || *t == Type::TEXT
         || *t == Type::BPCHAR
@@ -320,13 +359,82 @@ fn json_to_decimal(value: &Value, trino_type: &str) -> PgWireResult<Decimal> {
 fn json_to_timestamp(value: &Value, trino_type: &str) -> PgWireResult<NaiveDateTime> {
     let s = value
         .as_str()
-        .ok_or_else(|| conversion_error("timestamp", trino_type))?
-        .trim();
-    NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f")
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S"))
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f"))
-        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"))
-        .map_err(|_| conversion_error("timestamp", trino_type))
+        .ok_or_else(|| conversion_error("timestamp", trino_type))?;
+    parse_naive_datetime(s.trim()).ok_or_else(|| conversion_error("timestamp", trino_type))
+}
+
+/// Trino separates date and time with a space; the ISO-8601 `T` turns up in
+/// values that passed through a client library on the way in. `%.f` also
+/// matches an absent fraction, so `timestamp(0)` needs no extra format.
+fn parse_naive_datetime(s: &str) -> Option<NaiveDateTime> {
+    let s = truncate_fraction(s);
+    NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(&s, "%Y-%m-%dT%H:%M:%S%.f"))
+        .ok()
+}
+
+/// Shorten a fractional-second field longer than nine digits.
+///
+/// Trino goes to picosecond precision (`timestamp(12)`), while chrono's `%.f`
+/// parses at most nine digits and treats the rest as trailing garbage, failing
+/// the whole value. PostgreSQL stores microseconds, so the dropped digits could
+/// not have reached the client anyway.
+fn truncate_fraction(s: &str) -> Cow<'_, str> {
+    let Some(dot) = s.find('.') else {
+        return Cow::Borrowed(s);
+    };
+    let fraction_start = dot + 1;
+    let fraction_len = s[fraction_start..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    if fraction_len <= 9 {
+        return Cow::Borrowed(s);
+    }
+    let mut truncated = String::with_capacity(s.len());
+    truncated.push_str(&s[..fraction_start + 9]);
+    truncated.push_str(&s[fraction_start + fraction_len..]);
+    Cow::Owned(truncated)
+}
+
+fn json_to_timestamptz(value: &Value, trino_type: &str) -> PgWireResult<DateTime<Utc>> {
+    let s = value
+        .as_str()
+        .ok_or_else(|| conversion_error("timestamptz", trino_type))?;
+    parse_trino_timestamptz(s).ok_or_else(|| conversion_error("timestamptz", trino_type))
+}
+
+/// Parse Trino's rendering of `timestamp(p) with time zone`.
+///
+/// Trino carries a zone per value and renders it either as a fixed offset
+/// (`2026-06-01 10:30:00.000000 +02:00`, sometimes without the space) or as a
+/// named zone (`2026-06-01 10:30:00.000000 Europe/Berlin`, which is also how
+/// plain `UTC` arrives). PostgreSQL's `timestamptz` is a bare instant, so both
+/// shapes collapse to UTC.
+fn parse_trino_timestamptz(s: &str) -> Option<DateTime<Utc>> {
+    let s = truncate_fraction(s.trim());
+    let s = s.as_ref();
+    for fmt in [
+        "%Y-%m-%d %H:%M:%S%.f%#z",
+        "%Y-%m-%d %H:%M:%S%.f %#z",
+        "%Y-%m-%dT%H:%M:%S%.f%#z",
+        "%Y-%m-%dT%H:%M:%S%.f %#z",
+    ] {
+        if let Ok(dt) = DateTime::parse_from_str(s, fmt) {
+            return Some(dt.with_timezone(&Utc));
+        }
+    }
+
+    let (stamp, zone) = s.rsplit_once(' ')?;
+    let tz: Tz = zone.parse().ok()?;
+    let naive = parse_naive_datetime(stamp.trim())?;
+    // A named zone is local wall-clock time: a DST fold leaves two candidate
+    // instants, a DST gap none, and the rendered text cannot say which is
+    // meant. `single()` returns None for both, so the caller fails closed
+    // rather than shift the value by an hour without saying so.
+    tz.from_local_datetime(&naive)
+        .single()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 fn json_to_date(value: &Value, trino_type: &str) -> PgWireResult<NaiveDate> {
@@ -342,9 +450,139 @@ fn json_to_time(value: &Value, trino_type: &str) -> PgWireResult<NaiveTime> {
         .as_str()
         .ok_or_else(|| conversion_error("time", trino_type))?
         .trim();
-    NaiveTime::parse_from_str(s, "%H:%M:%S%.f")
-        .or_else(|_| NaiveTime::parse_from_str(s, "%H:%M:%S"))
+    NaiveTime::parse_from_str(&truncate_fraction(s), "%H:%M:%S%.f")
         .map_err(|_| conversion_error("time", trino_type))
+}
+
+fn json_to_timetz(value: &Value, trino_type: &str) -> PgWireResult<TimeTz> {
+    let s = value
+        .as_str()
+        .ok_or_else(|| conversion_error("timetz", trino_type))?;
+    parse_trino_timetz(s).ok_or_else(|| conversion_error("timetz", trino_type))
+}
+
+/// Parse Trino's rendering of `time(p) with time zone`, e.g.
+/// `10:30:00.000000+02:00`. Trino only ever carries a fixed offset for this
+/// type — resolving a named zone would need a date — so unlike in
+/// `parse_trino_timestamptz` the offset is mandatory.
+fn parse_trino_timetz(s: &str) -> Option<TimeTz> {
+    // chrono has no `timetz` equivalent, but it does validate offsets while
+    // parsing a `DateTime`. Lend the value a dummy date, then keep only the
+    // wall-clock time and the offset it was written with.
+    let dated = format!("2000-01-01 {}", truncate_fraction(s.trim()));
+    for fmt in ["%Y-%m-%d %H:%M:%S%.f%#z", "%Y-%m-%d %H:%M:%S%.f %#z"] {
+        if let Ok(dt) = DateTime::parse_from_str(&dated, fmt) {
+            return Some(TimeTz {
+                time: dt.time(),
+                offset_east_seconds: dt.offset().local_minus_utc(),
+            });
+        }
+    }
+    None
+}
+
+/// A PostgreSQL `timetz`: a time of day plus the UTC offset it was written
+/// with. No chrono type carries that pair, so `postgres-types` has no `ToSql`
+/// for it either and both wire encodings live here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimeTz {
+    time: NaiveTime,
+
+    /// Seconds *east* of UTC, the chrono and ISO-8601 convention — the
+    /// opposite of the one on the wire (see `to_sql`).
+    offset_east_seconds: i32,
+}
+
+impl TimeTz {
+    /// PostgreSQL's text form, e.g. `10:30:00+02`.
+    fn to_pg_text(self) -> String {
+        format!(
+            "{}{}{}",
+            self.time.format("%H:%M:%S"),
+            format_fraction(self.time.nanosecond()),
+            format_utc_offset(self.offset_east_seconds)
+        )
+    }
+}
+
+impl ToSql for TimeTz {
+    /// PostgreSQL's `timetz_send`: int64 microseconds since midnight, then the
+    /// zone offset as an int32 in seconds *west* of UTC, i.e. negated against
+    /// ISO-8601. Both PostgreSQL (`DecodeTimezone`) and Npgsql (`TimeTzHandler`)
+    /// apply that negation, so it is the wire contract, not an implementation
+    /// detail.
+    fn to_sql(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        let micros = self
+            .time
+            .signed_duration_since(NaiveTime::MIN)
+            .num_microseconds()
+            .ok_or("time of day does not fit in a microsecond count")?;
+        out.put_i64(micros);
+        out.put_i32(-self.offset_east_seconds);
+        Ok(IsNull::No)
+    }
+
+    fn accepts(ty: &Type) -> bool {
+        *ty == Type::TIMETZ
+    }
+
+    to_sql_checked!();
+}
+
+impl ToSqlText for TimeTz {
+    fn to_sql_text(
+        &self,
+        _ty: &Type,
+        out: &mut BytesMut,
+        _format_options: &FormatOptions,
+    ) -> Result<IsNull, Box<dyn Error + Sync + Send>> {
+        out.put_slice(self.to_pg_text().as_bytes());
+        Ok(IsNull::No)
+    }
+}
+
+/// PostgreSQL renders `timestamptz` in the session time zone. The gateway pins
+/// that to UTC — both the `TimeZone` startup parameter and the `SHOW timezone`
+/// intercept report UTC — so every instant goes out as UTC.
+fn render_timestamptz_text(dt: DateTime<Utc>) -> String {
+    format!(
+        "{}{}+00",
+        dt.format("%Y-%m-%d %H:%M:%S"),
+        format_fraction(dt.nanosecond())
+    )
+}
+
+/// PostgreSQL's fractional-second spelling: microsecond resolution, trailing
+/// zeros trimmed, nothing at all when the fraction is zero. A server emits
+/// `10:30:00.5`, never `10:30:00.500000`; chrono's `%.f` would pad to whole
+/// groups of three digits instead.
+fn format_fraction(nanoseconds: u32) -> String {
+    // chrono folds a leap second into the nanosecond field, which would carry
+    // the fraction past six digits.
+    let micros = (nanoseconds / 1_000).min(999_999);
+    if micros == 0 {
+        return String::new();
+    }
+    format!(".{micros:06}").trim_end_matches('0').to_owned()
+}
+
+/// PostgreSQL's offset spelling: `+02`, widened to `+02:30` or `+02:30:15`
+/// only when the finer fields carry something.
+fn format_utc_offset(seconds_east: i32) -> String {
+    let sign = if seconds_east < 0 { '-' } else { '+' };
+    let total = seconds_east.unsigned_abs();
+    let (hours, minutes, seconds) = (total / 3600, (total % 3600) / 60, total % 60);
+    if seconds != 0 {
+        format!("{sign}{hours:02}:{minutes:02}:{seconds:02}")
+    } else if minutes != 0 {
+        format!("{sign}{hours:02}:{minutes:02}")
+    } else {
+        format!("{sign}{hours:02}")
+    }
 }
 
 /// A value Trino returned could not be converted to the target PG type's
@@ -885,6 +1123,335 @@ mod tests {
     fn binary_timestamp_without_fraction_parses() {
         let bytes = bin(&json!("2026-06-01 10:30:00"), Type::TIMESTAMP, "timestamp");
         assert_eq!(bytes.len(), 8);
+    }
+
+    #[test]
+    fn parametric_timestamptz_maps_to_timestamptz() {
+        // Trino always reports the precision, and it sits *inside* the type
+        // name, so a naive strip at the first `(` swallows the time zone.
+        assert_eq!(
+            trino_type_to_pg("timestamp(6) with time zone"),
+            Type::TIMESTAMPTZ
+        );
+        assert_eq!(trino_type_to_pg("time(6) with time zone"), Type::TIMETZ);
+        assert_eq!(trino_type_to_pg("timestamp(3)"), Type::TIMESTAMP);
+        assert_eq!(trino_type_to_pg("time(3)"), Type::TIME);
+    }
+
+    #[test]
+    fn nested_type_params_collapse_to_the_base_name() {
+        assert_eq!(
+            trino_type_to_pg("map(varchar, array(integer))"),
+            Type::JSONB
+        );
+        assert_eq!(
+            trino_type_to_pg("array(timestamp(6) with time zone)"),
+            Type::TIMESTAMPTZ_ARRAY
+        );
+    }
+
+    /// Micros since the PostgreSQL epoch (2000-01-01 00:00:00 UTC), the unit
+    /// of both binary timestamp types.
+    fn micros_since_pg_epoch(dt: DateTime<Utc>) -> i64 {
+        let epoch = NaiveDate::from_ymd_opt(2000, 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc();
+        (dt - epoch).num_microseconds().unwrap()
+    }
+
+    fn binary_timestamptz_micros(value: &str) -> i64 {
+        let bytes = bin(
+            &json!(value),
+            Type::TIMESTAMPTZ,
+            "timestamp(6) with time zone",
+        );
+        i64::from_be_bytes(bytes.try_into().expect("8 bytes"))
+    }
+
+    #[test]
+    fn binary_timestamptz_accepts_every_shape_trino_renders() {
+        // 2026-06-01 08:30:00Z, written four ways.
+        let expected = micros_since_pg_epoch(
+            NaiveDate::from_ymd_opt(2026, 6, 1)
+                .unwrap()
+                .and_hms_opt(8, 30, 0)
+                .unwrap()
+                .and_utc(),
+        );
+        for value in [
+            "2026-06-01 08:30:00.000000 UTC",
+            "2026-06-01 10:30:00.000000 Europe/Berlin",
+            "2026-06-01 10:30:00.000000 +02:00",
+            "2026-06-01 10:30:00.000000+02:00",
+        ] {
+            assert_eq!(
+                binary_timestamptz_micros(value),
+                expected,
+                "wrong instant for {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn binary_timestamptz_without_fraction_parses() {
+        assert_eq!(
+            binary_timestamptz_micros("2026-06-01 08:30:00 UTC"),
+            binary_timestamptz_micros("2026-06-01 08:30:00.000000 UTC")
+        );
+    }
+
+    #[test]
+    fn binary_timestamptz_rejects_dst_ambiguous_local_time() {
+        // 2026-10-25 02:30 happens twice in Europe/Berlin, 2026-03-29 02:30 not
+        // at all. Guessing an hour would be silent data corruption.
+        for value in [
+            "2026-10-25 02:30:00.000000 Europe/Berlin",
+            "2026-03-29 02:30:00.000000 Europe/Berlin",
+        ] {
+            let res = encode_one(
+                &json!(value),
+                Type::TIMESTAMPTZ,
+                "timestamp(6) with time zone",
+                FieldFormat::Binary,
+            );
+            assert!(res.is_err(), "{value} must fail closed");
+        }
+    }
+
+    #[test]
+    fn binary_timestamptz_rejects_unknown_zone() {
+        let res = encode_one(
+            &json!("2026-06-01 10:30:00.000000 Mars/Olympus_Mons"),
+            Type::TIMESTAMPTZ,
+            "timestamp(6) with time zone",
+            FieldFormat::Binary,
+        );
+        assert!(res.is_err(), "unknown zone must fail closed");
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// Pins the wire layouts — notably `timetz`'s sign-inverted zone field,
+    /// which no client in this stack can round-trip — against PostgreSQL 18
+    /// itself. The expected byte strings are the output of:
+    ///
+    /// ```sql
+    /// SELECT encode(timetz_send('10:30:00+02'::timetz), 'hex'),
+    ///        encode(timestamptz_send('2026-06-01 10:30:00+02'::timestamptz), 'hex'),
+    ///        encode(timestamp_send('2026-06-01 10:30:00'::timestamp), 'hex');
+    /// ```
+    #[test]
+    fn binary_layouts_match_postgres_send_functions() {
+        for (value, pg_type, trino_type, expected) in [
+            (
+                "10:30:00+02:00",
+                Type::TIMETZ,
+                "time(6) with time zone",
+                "00000008cd0e3a00ffffe3e0",
+            ),
+            (
+                "10:30:00-05:00",
+                Type::TIMETZ,
+                "time(6) with time zone",
+                "00000008cd0e3a0000004650",
+            ),
+            (
+                "2026-06-01 10:30:00.000000 +02:00",
+                Type::TIMESTAMPTZ,
+                "timestamp(6) with time zone",
+                "0002f62bc4d8f200",
+            ),
+            (
+                "2026-06-01 10:30:00.000000",
+                Type::TIMESTAMP,
+                "timestamp(6)",
+                "0002f62d72003a00",
+            ),
+        ] {
+            assert_eq!(
+                hex(&bin(&json!(value), pg_type, trino_type)),
+                expected,
+                "wire bytes for {value}"
+            );
+        }
+    }
+
+    /// Trino renders more precision than chrono parses or PostgreSQL stores,
+    /// so sub-microsecond digits are dropped rather than failing the value.
+    #[test]
+    fn picosecond_precision_truncates_to_microseconds() {
+        assert_eq!(
+            binary_timestamptz_micros("2026-06-01 08:30:00.123456789012 UTC"),
+            binary_timestamptz_micros("2026-06-01 08:30:00.123456 UTC")
+        );
+        // The zone-less types hit the same limit.
+        assert_eq!(
+            bin(
+                &json!("2026-06-01 10:30:00.123456789012"),
+                Type::TIMESTAMP,
+                "timestamp(12)"
+            ),
+            bin(
+                &json!("2026-06-01 10:30:00.123456"),
+                Type::TIMESTAMP,
+                "timestamp(6)"
+            )
+        );
+        assert_eq!(
+            bin(&json!("10:30:00.123456789012"), Type::TIME, "time(12)"),
+            bin(&json!("10:30:00.123456"), Type::TIME, "time(6)")
+        );
+        assert_eq!(
+            bin(
+                &json!("10:30:00.123456789012+02:00"),
+                Type::TIMETZ,
+                "time(12) with time zone"
+            ),
+            bin(
+                &json!("10:30:00.123456+02:00"),
+                Type::TIMETZ,
+                "time(6) with time zone"
+            )
+        );
+    }
+
+    #[test]
+    fn binary_timetz_is_micros_then_negated_offset() {
+        // Offset counted in seconds *west* of UTC: +02:00 → -7200.
+        let bytes = bin(
+            &json!("10:30:00.000000+02:00"),
+            Type::TIMETZ,
+            "time(6) with time zone",
+        );
+        assert_eq!(bytes.len(), 12);
+        let (micros, zone) = bytes.split_at(8);
+        assert_eq!(
+            i64::from_be_bytes(micros.try_into().expect("8 bytes")),
+            (10 * 3600 + 30 * 60) * 1_000_000
+        );
+        assert_eq!(i32::from_be_bytes(zone.try_into().expect("4 bytes")), -7200);
+    }
+
+    #[test]
+    fn binary_timetz_requires_an_offset() {
+        // A bare time is not a `time with time zone` value; guessing UTC would
+        // silently move it.
+        let res = encode_one(
+            &json!("10:30:00.000000"),
+            Type::TIMETZ,
+            "time(6) with time zone",
+            FieldFormat::Binary,
+        );
+        assert!(res.is_err(), "offset-less timetz must fail closed");
+    }
+
+    fn text_of(value: &Value, pg_type: Type, trino_type: &str) -> String {
+        let bytes = encode_one(value, pg_type, trino_type, FieldFormat::Text)
+            .expect("text encode should succeed")
+            .expect("non-null value");
+        String::from_utf8(bytes).expect("utf-8")
+    }
+
+    #[test]
+    fn text_timestamptz_is_rendered_in_utc_like_postgres() {
+        // Both Trino spellings must come out in the pinned session zone.
+        for value in [
+            "2026-06-01 10:30:00.000000 Europe/Berlin",
+            "2026-06-01 10:30:00.000000+02:00",
+        ] {
+            assert_eq!(
+                text_of(
+                    &json!(value),
+                    Type::TIMESTAMPTZ,
+                    "timestamp(6) with time zone"
+                ),
+                "2026-06-01 08:30:00+00"
+            );
+        }
+    }
+
+    /// Expected strings are PostgreSQL 18's own `::text` output for the same
+    /// values under `SET timezone='UTC'`, the zone the gateway advertises.
+    #[test]
+    fn text_forms_match_postgres_output() {
+        for (value, pg_type, trino_type, expected) in [
+            (
+                "2026-06-01 10:30:00.000000 +02:00",
+                Type::TIMESTAMPTZ,
+                "timestamp(6) with time zone",
+                "2026-06-01 08:30:00+00",
+            ),
+            (
+                "2026-06-01 10:30:00.500000 +02:00",
+                Type::TIMESTAMPTZ,
+                "timestamp(6) with time zone",
+                "2026-06-01 08:30:00.5+00",
+            ),
+            (
+                "2026-06-01 10:30:00.123456 +02:00",
+                Type::TIMESTAMPTZ,
+                "timestamp(6) with time zone",
+                "2026-06-01 08:30:00.123456+00",
+            ),
+            (
+                "10:30:00.000000+02:00",
+                Type::TIMETZ,
+                "time(6) with time zone",
+                "10:30:00+02",
+            ),
+            (
+                "10:30:00.500000+02:00",
+                Type::TIMETZ,
+                "time(6) with time zone",
+                "10:30:00.5+02",
+            ),
+            (
+                "10:30:00.000000+05:30",
+                Type::TIMETZ,
+                "time(6) with time zone",
+                "10:30:00+05:30",
+            ),
+            (
+                "10:30:00.000000-05:00",
+                Type::TIMETZ,
+                "time(6) with time zone",
+                "10:30:00-05",
+            ),
+        ] {
+            assert_eq!(
+                text_of(&json!(value), pg_type, trino_type),
+                expected,
+                "text form of {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_timestamptz_falls_back_to_pass_through() {
+        // Text cannot be misread the way binary can, so an unparseable value
+        // goes out unchanged rather than failing the whole result set.
+        let odd = "not a timestamp";
+        assert_eq!(
+            text_of(
+                &json!(odd),
+                Type::TIMESTAMPTZ,
+                "timestamp(6) with time zone"
+            ),
+            odd
+        );
+    }
+
+    #[test]
+    fn utc_offsets_use_postgres_spelling() {
+        assert_eq!(format_utc_offset(0), "+00");
+        assert_eq!(format_utc_offset(2 * 3600), "+02");
+        assert_eq!(format_utc_offset(-5 * 3600), "-05");
+        assert_eq!(format_utc_offset(5 * 3600 + 30 * 60), "+05:30");
+        assert_eq!(format_utc_offset(-(3600 + 60 + 1)), "-01:01:01");
     }
 
     #[test]

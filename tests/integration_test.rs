@@ -1121,15 +1121,12 @@ async fn test_extended_two_prepared_statements() {
     assert_eq!(rows_b[0].get::<_, i32>(0), 2);
 }
 
-/// End-to-end binary decode of the exact column types from the customer's
-/// failing Power BI preview: bigint, real, double, and timestamp (plus bool).
-/// tokio-postgres binds `result_format_codes = binary` for every column, so
-/// each `get::<T>()` here forces the gateway to emit PostgreSQL binary — the
-/// behaviour that was broken (text-only) and is the subject of the fix.
-/// Regression guard for the reported "ERROR on Float/Integer/Timestamp,
-/// strings fine" symptom. Trino-gated.
+/// End-to-end binary decode of the scalar types a Power BI preview binds:
+/// bigint, real, double, timestamp and bool. tokio-postgres requests binary
+/// for every column, so each `get::<T>()` forces the gateway to emit
+/// PostgreSQL binary rather than text. Trino-gated.
 #[tokio::test]
-async fn test_extended_binary_customer_column_types() {
+async fn test_extended_binary_scalar_column_types() {
     let config = match trino_config() {
         Some(c) => c,
         None => {
@@ -1164,6 +1161,87 @@ async fn test_extended_binary_customer_column_types() {
             .unwrap()
     );
     assert!(row.get::<_, bool>("e"));
+}
+
+/// Binary decode of `timestamp(p) with time zone`. Trino reports the precision
+/// inside the type name, which used to mis-map the column to a plain
+/// `timestamp` and fail with 22P03 as soon as a client bound it in binary.
+/// Decoding into `DateTime<Utc>` drives that whole path. Trino-gated.
+///
+/// `time(p) with time zone` shares the mapping but tokio-postgres has no
+/// `timetz` decoder, so it is covered by the unit tests in `types.rs`.
+#[tokio::test]
+async fn test_extended_binary_timestamptz() {
+    let config = match trino_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping: TRINO_HOST not set");
+            return;
+        }
+    };
+    let addr = start_gateway(config).await;
+    let client = connect(addr).await;
+
+    let expected = chrono::NaiveDate::from_ymd_opt(2026, 6, 1)
+        .unwrap()
+        .and_hms_opt(8, 30, 0)
+        .unwrap()
+        .and_utc();
+
+    // A named zone and a fixed offset take different parsing paths. The
+    // six-digit literals come back as `timestamp(6) with time zone`, the last
+    // one as `timestamp(12) with time zone` — precision chrono cannot parse
+    // unshortened.
+    let row = client
+        .query_one(
+            "SELECT TIMESTAMP '2026-06-01 10:30:00.000000 Europe/Berlin' AS a, \
+                    TIMESTAMP '2026-06-01 10:30:00.000000 +02:00' AS b, \
+                    TIMESTAMP '2026-06-01 10:30:00.000000000000 Europe/Berlin' AS c",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    for column in ["a", "b", "c"] {
+        assert_eq!(
+            row.get::<_, chrono::DateTime<chrono::Utc>>(column),
+            expected,
+            "column {column}"
+        );
+    }
+}
+
+/// The same values on the text path (the simple protocol never negotiates
+/// binary). PostgreSQL renders `timestamptz` in the session time zone, which
+/// the gateway pins to UTC, so Trino's `... Europe/Berlin` must come out as
+/// `...+00`; Npgsql's text decoder rejects the Trino spelling. Trino-gated.
+#[tokio::test]
+async fn test_simple_timestamptz_text_is_postgres_shaped() {
+    let config = match trino_config() {
+        Some(c) => c,
+        None => {
+            eprintln!("Skipping: TRINO_HOST not set");
+            return;
+        }
+    };
+    let addr = start_gateway(config).await;
+    let client = connect(addr).await;
+
+    let rows = extract_rows(
+        client
+            .simple_query(
+                "SELECT TIMESTAMP '2026-06-01 10:30:00.000000 Europe/Berlin' AS a, \
+                        TIMESTAMP '2026-06-01 10:30:00.500000 Europe/Berlin' AS b, \
+                        TIME '10:30:00.000000+02:00' AS c",
+            )
+            .await
+            .unwrap(),
+    );
+    assert_eq!(rows.len(), 1);
+    // Trino renders these as `... Europe/Berlin` and `10:30:00.000000+02:00`.
+    assert_eq!(rows[0].get(0), Some("2026-06-01 08:30:00+00"));
+    assert_eq!(rows[0].get(1), Some("2026-06-01 08:30:00.5+00"));
+    assert_eq!(rows[0].get(2), Some("10:30:00+02"));
 }
 
 /// Catalog-emulation queries reach Trino through the extended path too —
