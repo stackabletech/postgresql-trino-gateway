@@ -10,7 +10,8 @@ forwarding queries to Trino's REST API on the backend. Lets PG clients
 - The intercept layer answers `SET`, `SHOW`, `BEGIN`/`COMMIT`, and
   `pg_catalog` queries locally; everything else is forwarded.
 - The SQL rewriter transforms PG-dialect SQL to Trino-compatible SQL
-  (`::cast`, `ILIKE`, function-name remaps, type-name normalisation).
+  (`::cast`, `ILIKE`, function-name remaps, type-name normalisation,
+  `LIMIT`/`OFFSET` reordering).
 - The Trino backend forwards rewritten queries via the REST API and streams
   result pages back as PG wire-protocol DataRows.
 - Catalog emulation fakes `pg_type`, `pg_class`, `pg_attribute`, and a few
@@ -33,7 +34,7 @@ forwarding queries to Trino's REST API on the backend. Lets PG clients
   - `cancel.rs` — PG `CancelRequest` to Trino `DELETE /v1/query/{id}`
   - `session.rs` — per-connection state, cancel registry, portal cache
   - `catalog/` — `pg_catalog` emulation (`pg_type`, `pg_class`, `pg_attribute`, stubs)
-  - `rewrite/` — SQL rewriting (casts, predicates, functions)
+  - `rewrite/` — SQL rewriting (casts, predicates, functions, limit/offset)
   - `types.rs` — Trino-to-PG type mapping and value encoding
   - `trino_stream.rs` — streaming bridge (poll Trino, yield PG DataRow)
   - `error_mapping.rs` — Trino errors to PG SQLSTATE codes

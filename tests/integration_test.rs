@@ -453,6 +453,19 @@ trino_tests!(
             "SELECT name FROM (SELECT name FROM nation ORDER BY nationkey LIMIT 2 OFFSET 1) t ORDER BY name LIMIT 1",
             Check::Value { value: "ARGENTINA" }
         ),
+        // `LIMIT 0` must not become `FETCH FIRST 0 ROWS ONLY` — Trino rejects
+        // that with "FETCH FIRST row count must be positive". Both cases must
+        // execute and return no rows (Power BI probes schemas this way).
+        (
+            "pg-order limit zero offset",
+            "SELECT name FROM nation ORDER BY nationkey LIMIT 0 OFFSET 1",
+            Check::Rows { min_rows: 0 }
+        ),
+        (
+            "limit zero",
+            "SELECT name FROM nation LIMIT 0",
+            Check::Rows { min_rows: 0 }
+        ),
     ]
 );
 

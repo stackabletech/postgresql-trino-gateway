@@ -155,6 +155,10 @@ break Trino's strict-PostgreSQL parsing:
   `log` → `log10`, `trunc` → `truncate`.
 - PostgreSQL type names map to Trino: `text` → `VARCHAR`, `int4` →
   `INTEGER`, and so on.
+- `LIMIT n OFFSET m` is reordered into the order Trino's grammar
+  requires: `OFFSET m FETCH FIRST n ROWS ONLY`. `LIMIT 0 OFFSET m`
+  becomes a bare `LIMIT 0` — Trino rejects `FETCH FIRST 0 ROWS ONLY`,
+  and the offset makes no difference to an empty result.
 
 A handful of queries are intercepted and answered locally rather than
 forwarded:

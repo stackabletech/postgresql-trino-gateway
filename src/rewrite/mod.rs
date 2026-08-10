@@ -163,6 +163,20 @@ mod tests {
             must_not_contain: &["FETCH", "LIMIT", "ALL"],
         },
         Case {
+            // Trino rejects `FETCH FIRST 0 ROWS ONLY`; `LIMIT 0 OFFSET m` is
+            // empty for every `m`, so the OFFSET is dropped as well.
+            name: "LIMIT 0 OFFSET m → bare LIMIT 0 (no FETCH)",
+            input: "SELECT name FROM t ORDER BY name LIMIT 0 OFFSET 1",
+            must_contain: &["LIMIT 0"],
+            must_not_contain: &["FETCH", "OFFSET"],
+        },
+        Case {
+            name: "LIMIT 0 without OFFSET is left unchanged",
+            input: "SELECT name FROM t LIMIT 0",
+            must_contain: &["LIMIT 0"],
+            must_not_contain: &["FETCH", "OFFSET"],
+        },
+        Case {
             name: "subquery LIMIT+OFFSET is reordered too",
             input: "SELECT * FROM (SELECT name FROM t ORDER BY name LIMIT 2 OFFSET 1) x",
             must_contain: &["OFFSET 1", "FETCH FIRST 2"],
