@@ -10,13 +10,16 @@ Pre-1.0. The protocol surface is what Power BI Report Server exercises in
 DirectQuery mode against TPC-H. Other PG clients (Npgsql, pgjdbc, `psql`)
 work for read queries; INSERT/UPDATE/CREATE TABLE work via simple-query
 and via prepared statements. Multi-statement batches are split and run one
-at a time. Wire format is text only.
+at a time. Both the text and binary wire formats are served, for the
+scalar types — see "Wire format" below.
 
 What is intentionally not implemented for now:
 
 - SCRAM-SHA-256 (the gateway holds the cleartext password to forward as
   HTTP Basic auth to Trino, which doesn't compose with SCRAM).
-- Binary wire format.
+- Binary wire format for composite types (arrays, and `map` / `row`
+  mapped to `jsonb`). Scalars are supported; anything else asked for in
+  binary is refused rather than mis-encoded. See "Wire format".
 - Per-IP rate limiting (only a global concurrent-connection cap).
 - Cancel of statements in a multi-statement batch other than the
   most-recently-submitted one.
@@ -182,28 +185,35 @@ value as its canonical PostgreSQL string representation (e.g. `42`,
 `true`, `2026-04-30`); binary format uses a compact, type-specific byte
 layout (e.g. a big-endian 4-byte integer for `int4`).
 
-This gateway emits **text only**. Two reasons:
+The gateway honours the format the client requests for each column
+(`trino_stream.rs::build_pg_schema`), for the scalar types that
+binary-requesting drivers actually bind:
 
-- **Compatibility.** Power BI Report Server uses Npgsql 4.0.17, whose
-  decoder for many composite/array types in binary format expects the
-  exact byte layout PostgreSQL 9.x produces. Trino's REST API hands us
-  values as JSON; reconstructing PostgreSQL's binary layout faithfully
-  for every type would be a large amount of error-prone code, and the
-  text form is what Npgsql's text decoder is happy with.
-- **Limited upside.** Binary format saves CPU and a small amount of
-  bytes for tight numeric workloads, but the gateway's bottleneck is
-  the Trino REST round-trip and JSON decode, not the wire encoding of
-  the final row. The gain wouldn't be visible in a real query path.
+- `bool`
+- `int2`, `int4`, `int8`, `float4`, `float8`, `numeric`
+- `date`, `time`, `timetz`, `timestamp`, `timestamptz`
+- the string family (`varchar`, `text`, `bpchar`, `name`), whose text
+  and binary layouts are identical
 
-The cost is that values cross the wire as decimal strings, ISO-format
-dates, and so on; clients that only support binary format won't work
-against the gateway. None of our documented clients (Power BI, Npgsql,
-pgjdbc, `psql`) require binary.
+Any other type requested in binary is refused with SQLSTATE 0A000
+(`feature_not_supported`), and a value that cannot be converted to its
+target type's binary form fails with SQLSTATE 22P03
+(`invalid_binary_representation`). Neither case falls back to text: the
+client decodes strictly per the format code it bound, so text bytes
+delivered for a binary column are read as a byte layout and silently
+mis-parsed. Failing the query is the only honest option.
 
-If a future deployment needs binary format, the natural place to
-implement it is in `types.rs::encode_value` (per-column branch on the
-client-requested format code) and the `FieldFormat::Text` constants in
-`trino_stream.rs::build_pg_schema` and the catalog responders.
+Composite types — arrays, and `map` / `row` mapped to `jsonb` — are the
+notable gap. Power BI Report Server ships Npgsql 4.0.17, whose binary
+decoder for these expects the exact byte layout PostgreSQL 9.x produces,
+and Trino's REST API hands us values as JSON; reconstructing that layout
+faithfully is a large amount of error-prone code for types the
+DirectQuery path does not bind in binary anyway.
+
+Catalog-emulation responses (`pg_catalog`, `INFORMATION_SCHEMA`) are
+always encoded as text (`catalog/mod.rs`).
+
+The per-type binary encoders live in `types.rs::encode_binary_cell`.
 
 ## Test
 
@@ -257,11 +267,6 @@ TRINO_HOST=... TRINO_PORT=... TRINO_SSL=true TRINO_TLS_NO_VERIFY=true \
     TRINO_CATALOG=tpch TRINO_SCHEMA=sf1 \
     TRINO_WRITE_CATALOG=memory TRINO_WRITE_SCHEMA=default \
     cargo test --test integration_test
-
-# Three tokio-postgres extended-protocol tests that depend on binary
-# wire format are `#[ignore]`-marked (see "Wire format" above). Run
-# them on demand once binary support lands:
-cargo test --test integration_test -- --ignored
 ```
 
 `pre-commit run --all-files` runs the full battery (fmt, clippy, tests,
