@@ -11,7 +11,7 @@
 # (oci.stackable.tech/sdp/ubi9-rust-builder); the COPY+cargo step below
 # is a no-op when the binary is already present at /app.
 
-ARG BUILDER_IMAGE=docker.io/library/rust:1.93-slim-bookworm
+ARG BUILDER_IMAGE=docker.io/library/rust:1.97.1-slim-bookworm
 
 # hadolint ignore=DL3006
 FROM ${BUILDER_IMAGE} AS builder
