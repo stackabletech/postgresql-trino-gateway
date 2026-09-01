@@ -1,0 +1,29 @@
+---
+name: prek
+permissions: {}
+
+on:
+  pull_request:
+  merge_group:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN_VERSION: "1.97.1"
+
+jobs:
+  prek:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@37f7c5781271959fb65b6b35224e28652ff2b63d # v2.87.0
+        with:
+          tool: cargo-deny
+
+      - uses: stackabletech/actions/run-prek@e8aed001d347bcf693e41b61f4098b0cb94b4ab6 # v0.18.0
+        with:
+          rust: ${{ env.RUST_TOOLCHAIN_VERSION }}

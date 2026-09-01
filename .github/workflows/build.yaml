@@ -1,8 +1,6 @@
 ---
 name: Build and Test
-
-permissions:
-  contents: read
+permissions: {}
 
 on:
   push:
@@ -20,10 +18,9 @@ jobs:
     name: Unit Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
@@ -32,7 +29,7 @@ jobs:
           components: clippy
 
       - name: Setup Rust Cache
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Build
         run: cargo build --release
@@ -49,15 +46,14 @@ jobs:
     needs: [unit-tests]
     steps:
       - name: Install host dependencies
-        uses: awalsh128/cache-apt-pkgs-action@acb598e5ddbc6f68a970c5da0688d2f3a9f04d05 # v1.6.0
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
         with:
           packages: musl-tools
           version: ubuntu-latest
 
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install Rust ${{ env.RUST_TOOLCHAIN_VERSION }} toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9
@@ -66,7 +62,7 @@ jobs:
           targets: x86_64-unknown-linux-musl
 
       - name: Setup Rust Cache
-        uses: Swatinem/rust-cache@23869a5bd66c73db3c0ac40331f3206eb23791dc # v2.9.1
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: musl
 

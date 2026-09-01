@@ -1,5 +1,6 @@
 ---
 name: Daily Security Audit
+permissions: {}
 
 on:
   schedule:
@@ -7,18 +8,17 @@ on:
     - cron: '15 4 * * *'
   workflow_dispatch:
 
-permissions:
-  contents: read
-  issues: write
-
 jobs:
   audit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write # Needed for rustsec/audit-check to publish a check run
+      issues: write # Needed for rustsec/audit-check to file an issue per advisory
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         # Build against stable because cargo-audit sometimes depends on things
