@@ -13,6 +13,7 @@ pub(crate) mod query_inspection;
 pub(crate) mod query_pipeline;
 pub mod query_simple;
 pub mod rewrite;
+pub mod server;
 pub mod session;
 pub mod startup;
 pub mod tls;

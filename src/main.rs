@@ -6,7 +6,6 @@ use std::time::Duration;
 use clap::Parser;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use postgresql_trino_gateway::config::Config;
@@ -14,6 +13,7 @@ use postgresql_trino_gateway::handler::GatewayHandlerFactory;
 use postgresql_trino_gateway::policy;
 use postgresql_trino_gateway::query_extended::GatewayExtendedQueryHandler;
 use postgresql_trino_gateway::query_simple::GatewayQueryHandler;
+use postgresql_trino_gateway::server;
 use postgresql_trino_gateway::startup::GatewayStartupHandler;
 use postgresql_trino_gateway::tls;
 
@@ -78,8 +78,6 @@ async fn main() -> anyhow::Result<()> {
              Use a positive value (default 256)."
         );
     }
-    let connection_limit = Arc::new(Semaphore::new(config.max_connections));
-
     let listener = TcpListener::bind(&config.listen_addr).await?;
     tracing::info!(
         addr = %config.listen_addr,
@@ -92,64 +90,25 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let mut sigterm = signal(SignalKind::terminate())?;
-    let ctrl_c = tokio::signal::ctrl_c();
-    tokio::pin!(ctrl_c);
-    let mut tasks: JoinSet<()> = JoinSet::new();
-
-    loop {
-        // `biased` ensures shutdown signals are observed before another
-        // accept fires when several branches are simultaneously ready.
-        // Signal branches return Pending when no signal is queued, so the
-        // accept branch is not starved under normal load.
+    let shutdown = async move {
         tokio::select! {
-            biased;
-            _ = &mut ctrl_c => {
+            _ = tokio::signal::ctrl_c() => {
                 tracing::info!("received SIGINT, beginning graceful shutdown");
-                break;
             }
             _ = sigterm.recv() => {
                 tracing::info!("received SIGTERM, beginning graceful shutdown");
-                break;
-            }
-            accept = listener.accept() => {
-                let (socket, peer_addr) = accept?;
-                // Take a permit before spawning the connection task. When
-                // the cap is reached we drop the socket immediately rather
-                // than queue the connection, so a flood of incoming SYNs
-                // can't pile up FD/memory pressure waiting for a slot.
-                //
-                // The PG protocol *does* allow a graceful refusal — an
-                // `ErrorResponse` (SQLSTATE 53300, `too_many_connections`)
-                // followed by a close — but issuing it requires reading
-                // the client's StartupMessage first, which itself consumes
-                // resources and defeats the SYN-flood mitigation above.
-                // Clients see a TCP close instead; the warning below makes
-                // the cause visible operator-side.
-                let permit = match Arc::clone(&connection_limit).try_acquire_owned() {
-                    Ok(p) => p,
-                    Err(_) => {
-                        tracing::warn!(
-                            addr = %peer_addr,
-                            cap = config.max_connections,
-                            "rejecting connection — max_connections reached"
-                        );
-                        drop(socket);
-                        continue;
-                    }
-                };
-                let factory = Arc::clone(&factory);
-                let tls = tls_acceptor.clone();
-                tasks.spawn(async move {
-                    let _permit = permit; // released on task exit
-                    if let Err(e) = pgwire::tokio::process_socket(socket, tls, factory).await {
-                        tracing::error!(addr = %peer_addr, error = %e, "connection error");
-                    }
-                });
             }
         }
-    }
+    };
 
-    drop(listener);
+    let tasks = server::serve(
+        listener,
+        factory,
+        tls_acceptor,
+        config.max_connections,
+        shutdown,
+    )
+    .await?;
     drain(tasks, drain_timeout).await;
     Ok(())
 }
@@ -198,7 +157,7 @@ async fn drain(mut tasks: JoinSet<()>, timeout: Duration) {
 
     let drain_loop = async {
         while let Some(res) = tasks.join_next().await {
-            log_task_result(res);
+            server::log_task_result(res);
         }
     };
 
@@ -212,22 +171,12 @@ async fn drain(mut tasks: JoinSet<()>, timeout: Duration) {
         tasks.abort_all();
         let _ = tokio::time::timeout(ABORT_UNWIND_GRACE, async {
             while let Some(res) = tasks.join_next().await {
-                log_task_result(res);
+                server::log_task_result(res);
             }
         })
         .await;
     } else {
         tracing::info!("all connections drained");
-    }
-}
-
-fn log_task_result(res: Result<(), tokio::task::JoinError>) {
-    if let Err(e) = res {
-        if e.is_panic() {
-            tracing::error!(error = %e, "connection task panicked");
-        } else if !e.is_cancelled() {
-            tracing::error!(error = %e, "connection task failed during drain");
-        }
     }
 }
 
@@ -281,20 +230,6 @@ mod tests {
             0,
             "tasks should have been aborted before completing"
         );
-    }
-
-    /// Smoke test for the connection-limiting primitive: with a 2-permit
-    /// semaphore, two `try_acquire_owned` calls succeed and the third
-    /// fails. After dropping one permit, a new acquisition succeeds.
-    /// Pins the semaphore behaviour the accept loop depends on.
-    #[tokio::test]
-    async fn semaphore_caps_concurrent_permits() {
-        let sem = Arc::new(Semaphore::new(2));
-        let p1 = Arc::clone(&sem).try_acquire_owned().unwrap();
-        let _p2 = Arc::clone(&sem).try_acquire_owned().unwrap();
-        assert!(Arc::clone(&sem).try_acquire_owned().is_err());
-        drop(p1);
-        assert!(Arc::clone(&sem).try_acquire_owned().is_ok());
     }
 
     #[test]
